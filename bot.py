@@ -1,147 +1,201 @@
+import sqlite3
 import asyncio
+import re
 import logging
 from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-from config import BOT_TOKEN, API_ID, API_HASH, ADMIN_ID
-from database import init_db, get_connection
-from utils import extract_links
-from keyboards import get_main_keyboard
+# --- الإعدادات الأساسية ---
+BOT_TOKEN = "8969957914:AAF33nKExvFFry5ImvGirDU4oYraLMX3tHc"
+API_ID = 39289901
+API_HASH = "a5dcef068387dd95705046f910d6cd48"
+
+# 👑 المطور والمالك الوحيد للنظام (منصة مَدّ الطبية)
+ADMIN_ID = 5064913080
 
 logging.basicConfig(level=logging.INFO)
-init_db()
+
+# --- إعداد قاعدة البيانات الدائمة (SQLite) ---
+db = sqlite3.connect("bot_final.db", check_same_thread=False)
+cursor = db.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, 
+    session TEXT, 
+    phone TEXT,
+    is_active INTEGER DEFAULT 0
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY, 
+    delay INTEGER DEFAULT 10,
+    rest_time INTEGER DEFAULT 5,
+    balance INTEGER DEFAULT 0
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    user_id INTEGER, 
+    link TEXT, 
+    status TEXT DEFAULT 'pending'
+)
+""")
+db.commit()
+
+# ترقية قاعدة البيانات تلقائياً في حال كانت الخانات ناقصة أو قديمة
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
+    db.commit()
+except sqlite3.OperationalError:
+    pass
 
 running_states = {}
 
+def extract_links(text):
+    pattern = r"(?:https?://)?(?:t\.me/|telegram\.me/)([a-zA-Z0-9_]+|joinchat/[a-zA-Z0-9_-]+|\+[a-zA-Z0-9_-]+)"
+    return re.findall(pattern, text)
+
+# 🛠️ منطق الانضمام الأساسي للتلغرام
 async def join_logic(session_str, link):
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
         await client.connect()
-        target_entity = None
-        is_request_join = False
         
         if "joinchat" in link or "+" in link:
             hash_val = link.split("/")[-1].replace("+", "").strip()
             try:
-                result = await client(functions.messages.ImportChatInviteRequest(hash=hash_val))
-                if hasattr(result, 'chats') and result.chats:
-                    target_entity = result.chats[0]
+                await client(functions.messages.ImportChatInviteRequest(hash=hash_val))
+                return "SUCCESS", "✅ تم الانضمام بنجاح (رابط خاص)"
             except Exception as e:
                 err_str = str(e).lower()
-                if "flood" in err_str or "wait" in err_str or "seconds" in err_str:
-                    return "RESTRICTED", f"⏳ الحساب مقيد مؤقتاً: {str(e)}"
-                try:
-                    res_check = await client(functions.messages.CheckChatInviteRequest(hash=hash_val))
-                    is_request_join = True
-                    return "SUCCESS_REQUEST", "⏳ تم إرسال طلب الانضمام وبانتظار الموافقة!"
-                except Exception as inner_e:
-                    if "alreadyinchannel" in str(inner_e).lower() or "user_already_participant" in str(inner_e).lower():
-                        target_entity = await client.get_entity(link)
-                    else:
+                if "flood" in err_str or "wait" in err_str or "seconds" in err_str or "requests" in err_str:
+                    return "RESTRICTED", f"⏳ الحساب مقيد مؤقتاً وبحاجة للانتظار: {str(e)}"
+                
+                if "request" in err_str or "ordered to wait" in err_str or "channelstoomuch" not in err_str:
+                    try:
+                        await client(functions.messages.CheckChatInviteRequest(hash=hash_val))
+                        return "SUCCESS", "⏳ تم إرسال طلب الانضمام وبانتظار موافقة الإدارة!"
+                    except Exception as inner_e:
+                        inner_str = str(inner_e).lower()
+                        if "alreadyinchannel" in inner_str or "user_already_participant" in inner_str: 
+                            return "SUCCESS", "🟢 أنت عضو بالفعل."
                         raise inner_e
+                raise e
         else:
             clean_link = link.split("/")[-1].strip()
             try:
-                result = await client(functions.channels.JoinChannelRequest(clean_link))
-                target_entity = await client.get_entity(clean_link)
+                await client(functions.channels.JoinChannelRequest(clean_link))
+                return "SUCCESS", "✅ تم الانضمام بنجاح (رابط عام)"
             except Exception as e:
                 err_str = str(e).lower()
-                if "flood" in err_str or "wait" in err_str or "seconds" in err_str:
-                    return "RESTRICTED", f"⏳ الحساب مقيد مؤقتاً: {str(e)}"
-                if "requested to join" in err_str:
-                    return "SUCCESS_REQUEST", "⏳ تم إرسال طلب الانضمام بانتظار الموافقة!"
-                target_entity = await client.get_entity(clean_link)
-                await client(functions.channels.JoinChannelRequest(channel=target_entity))
-
-        verified = False
-        if target_entity and not is_request_join:
-            await asyncio.sleep(3) 
-            try:
-                async for message in client.iter_messages(target_entity, limit=5):
-                    if message.reply_markup and hasattr(message.reply_markup, 'rows'):
-                        for row in message.reply_markup.rows:
-                            for button in row.buttons:
-                                if any(w in button.text.lower() for w in ["إنسان", "انسان", "أنا", "لست", "robot", "human", "verify", "تحقق"]):
-                                    await message.click(data=button.data)
-                                    await asyncio.sleep(1)
-                                    verified = True
-            except Exception:
-                pass
-
-        if is_request_join:
-            return "SUCCESS", "⏳ تم إرسال طلب الانضمام بنجاح"
-            
-        verify_str = " وتم التحقق بنجاح" if verified else ""
-        return "SUCCESS", f"✅ تم الانضمام{verify_str}"
+                if "flood" in err_str or "wait" in err_str or "seconds" in err_str or "requests" in err_str:
+                    return "RESTRICTED", f"⏳ الحساب مقيد مؤقتاً وبحاجة للانتظار: {str(e)}"
+                
+                if "requested to join" in err_str or "user_already_participant" in err_str:
+                    return "SUCCESS", "⏳ تم إرسال طلب الانضمام بنجاح وبانتظار موافقة الإدارة!"
+                
+                try:
+                    channel = await client.get_entity(clean_link)
+                    await client(functions.channels.JoinChannelRequest(channel=channel))
+                    return "SUCCESS", "✅ تم الانضمام بنجاح"
+                except Exception as inner_e:
+                    inner_err_str = str(inner_e).lower()
+                    if "flood" in inner_err_str or "wait" in inner_err_str or "seconds" in inner_err_str or "requests" in inner_err_str:
+                        return "RESTRICTED", f"⏳ الحساب مقيد مؤقتاً وبحاجة للانتظار: {str(inner_e)}"
+                    if "requested to join" in inner_err_str:
+                        return "SUCCESS", "⏳ تم إرسال طلب الانضمام بنجاح وبانتظار موافقة الإدارة!"
+                    if "alreadyinchannel" in inner_err_str or "user_already_participant" in inner_err_str: 
+                        return "🟢 عضو بالفعل"
+                    raise e
                     
     except Exception as e:
         err_str = str(e).lower()
         if "alreadyinchannel" in err_str or "user_already_participant" in err_str: 
-            return "SUCCESS", "✅ تم الانضمام مسبقاً"
+            return "🟢 عضو بالفعل"
         if "channelstoomuch" in err_str: 
             return "FAILED", "❌ الحساب ممتلئ قنوات!"
         return "FAILED", f"❌ فشل: {str(e)}"
     finally:
         await client.disconnect()
 
-async def background_task(user_id, context, active_acc, delay_time, rest_time_minutes, links):
+# 🚀 دالة الخلفية المنفصلة مع الخصم التلقائي (نقطة واحدة لكل رابط)
+async def background_join_task(user_id, context, active_acc, delay_time, rest_time_minutes, links):
     try:
         join_counter = 0
-        db = get_connection()
-        cursor = db.cursor()
+        local_db = sqlite3.connect("bot_final.db")
+        local_cursor = local_db.cursor()
 
         for lid, link in links:
             if not running_states.get(user_id): break
             
+            # 1. تحقق من النقاط قبل معالجة هذا الرابط (استثناء المشرف والمالك)
             if user_id != ADMIN_ID:
-                cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-                row_bal = cursor.fetchone()
-                if row_bal and row_bal[0] < 1:
-                    await context.bot.send_message(chat_id=user_id, text="⚠️ عذراً، نفدت نقاطك المتاحة. يرجى شحن نقاطك للمتابعة.")
+                local_cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+                current_bal = local_cursor.fetchone()[0]
+                if current_bal < 1:
+                    await context.bot.send_message(chat_id=user_id, text="⚠️ توقف النظام! لقد نفدت نقاطك المتاحة، يرجى شحن نقاطك للمتابعة.")
                     break
 
+            # 💤 الاستراحة الدورية (لكل 5 روابط)
             if join_counter > 0 and join_counter % 5 == 0:
-                await context.bot.send_message(chat_id=user_id, text=f"⏳ تم الانضمام لـ 5 روابط. البوت في استراحة لمدة {rest_time_minutes} دقائق...")
+                await context.bot.send_message(chat_id=user_id, text=f"⏳ تم الانضمام لـ 5 روابط بنجاح. البوت يدخل الآن في استراحة لمدة {rest_time_minutes} دقائق...")
                 for _ in range(int(rest_time_minutes * 60 * 10)):
                     if not running_states.get(user_id): break
                     await asyncio.sleep(0.1)
                 if not running_states.get(user_id): break
-                await context.bot.send_message(chat_id=user_id, text="🚀 انتهت الاستراحة، جاري استئناف العمل...")
+                await context.bot.send_message(chat_id=user_id, text="🚀 انتهت الاستراحة المحددة، جاري استئناف العمل...")
             
             while True:
                 if not running_states.get(user_id): break
+                
                 status, msg = await join_logic(active_acc[0], link)
                 
                 if status == "RESTRICTED":
-                    await context.bot.send_message(chat_id=user_id, text=f"⚠️ تليجرام فرض تقييداً مؤقتاً. جاري الانتظار 5 دقائق أمان ثم إعادة المحاولة...")
+                    await context.bot.send_message(chat_id=user_id, text=f"⚠️ تفاجأنا بطلب انتظار من تليجرام لحسابك.\n⏳ الحساب مقيد حالياً. سأدخل في استراحة أمان لمدة 5 دقائق كاملة، ثم سأعيد المحاولة تلقائياً على نفس الرابط دون توقف: {link}")
+                    
                     for _ in range(300 * 10):
                         if not running_states.get(user_id): break
                         await asyncio.sleep(0.1)
+                        
+                    if not running_states.get(user_id): break
+                    await context.bot.send_message(chat_id=user_id, text="🔄 انتهت الـ 5 دقائق، جاري إعادة محاولة الانضمام للرابط الحالي الآن...")
                     continue
                 
-                cursor.execute("UPDATE links SET status=? WHERE id=?", ('completed' if "SUCCESS" in status else 'failed', lid))
+                # تحديث حالة الرابط
+                local_cursor.execute("UPDATE links SET status=? WHERE id=?", ('completed' if status == "SUCCESS" else 'failed', lid))
+                
+                # 🎯 خصم نقطة واحدة من رصيد المستخدم لكل محاولة انضمام ناجحة
                 if user_id != ADMIN_ID:
-                    cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (user_id,))
-                db.commit()
+                    local_cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (user_id,))
+                local_db.commit()
                 
                 join_counter += 1
-                cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-                rem_bal = cursor.fetchone()[0]
+                
+                # جلب النقاط المتبقية لعرضها في الرسالة
+                local_cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+                rem_bal = local_cursor.fetchone()[0]
                 bal_str = "المشرف (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{rem_bal} نقطة"
                 
-                await context.bot.send_message(chat_id=user_id, text=f"📱 الرقم: {active_acc[1]}\n🔗 الرابط: {link}\nالنتيجة: {msg}\n🎯 النقاط المتبقية: {bal_str}")
+                await context.bot.send_message(chat_id=user_id, text=f"📱 الرقم: {active_acc[1]}\n🔗 الرابط: {link}\nالنتيجة: {msg}\n🎯 نقاطك المتبقية: {bal_str}")
                 break
             
             for _ in range(int(delay_time * 10)):
                 if not running_states.get(user_id): break
                 await asyncio.sleep(0.1)
         
-        await context.bot.send_message(chat_id=user_id, text="🏁 انتهت مهام الانضمام بنجاح تام.")
-        db.close()
-    except Exception as e:
-        logging.error(f"Task error: {e}")
+        if not running_states.get(user_id):
+            await context.bot.send_message(chat_id=user_id, text="🛑 تم إيقاف عملية الانضمام فوراً بطلبك.")
+        else:
+            await context.bot.send_message(chat_id=user_id, text="🏁 انتهت معالجة كافة الروابط للحساب الحالي بنجاح تام.")
+            
+        local_db.close()
+    except Exception as task_err:
+        logging.error(f"Error in background task for user {user_id}: {task_err}")
     finally:
         running_states[user_id] = False
 
@@ -149,24 +203,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     name = update.effective_user.first_name
     
-    db = get_connection()
-    cursor = db.cursor()
+    # التحقق أو إنشاء الحساب بـ 0 نقطة افتراضياً
     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
     db.commit()
+    
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
     balance = cursor.fetchone()[0]
-    db.close()
     
     context.user_data.clear()
+    
+    keyboard = [
+        [KeyboardButton("📱 تسجيل الدخول الجديد"), KeyboardButton("🔗 إرسال روابط")],
+        [KeyboardButton("🚀 بدء الانضمام"), KeyboardButton("🛑 إيقاف الانضمام")],
+        [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
+        [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
+        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
+        [KeyboardButton("🎯 شحن نقاطك")]
+    ]
+    
+    # أزرار لوحة تحكم المطور والمالك لتعبئة النقاط والإذاعة والتحكم الإداري
+    if user_id == ADMIN_ID:
+        keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("🔋 شحن نقاط لمعلم")])
+        keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
+        
     balance_display = "المشرف العام (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{balance} نقطة"
     
     await update.message.reply_text(
-        f"👋 مرحباً بك يا {name} في نظام الانضمام الذكي.\n\n"
-        f"يمكنك إدارة حسابات تيليجرام، إضافة الروابط، وتشغيل الانضمام التلقائي بسهولة.\n\n"
-        f"💳 **معرف حسابك:** `{user_id}`\n"
+        f"🙋‍♂️ أهلاً بك يا {name} في منصة مَدّ الطبية لإدارة الحسابات الموازية!\n\n"
+        f"💳 **معرف حسابك الرقمي:** `{user_id}`\n"
         f"🎯 **رصيدك الحالي:** {balance_display}\n\n"
-        f"اختر الخدمة التي تريدها من القائمة:", 
-        reply_markup=get_main_keyboard(user_id, ADMIN_ID),
+        f"📋 (تكلفة الانضمام للرابط الواحد هي نقطة واحدة فقط).\n"
+        f"الرجاء اختيار ما تريده من الأزرار المتاحة:", 
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="Markdown"
     )
 
@@ -178,360 +246,369 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     action = context.user_data.get('action')
     
-    db = get_connection()
-    cursor = db.cursor()
     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
     db.commit()
     
     if text == "/start":
-        db.close()
         return await start(update, context)
 
-    # 💎 شحن النقاط
-    if text == "💎 شحن النقاط":
-        db.close()
-        keyboard = [[InlineKeyboardButton("📩 التواصل مع الدعم", url="https://t.me/Ra11_8h")]]
+    # 📥 إنهاء إرسال الروابط وحفظها
+    if text == "📥 حفظ الروابط وإنهاء الإرسال" and action == 'add_links':
+        temp_links = context.user_data.get('temp_links_list', [])
+        if not temp_links:
+            await update.message.reply_text("⚠️ لم تقم بإرسال أي روابط صالحة لحفظها.")
+        else:
+            for l in temp_links:
+                cursor.execute("INSERT INTO links (user_id, link) VALUES (?, ?)", (user_id, l))
+            db.commit()
+            await update.message.reply_text(f"🏁 انتهى الإرسال بنجاح!\n✅ تم حفظ إجمالي عدد: ({len(temp_links)}) رابط داخل قائمة الانتظار الخاصة بك بنجاح تام.")
+        
+        context.user_data.clear()
+        return await start(update, context)
+
+    # 🎯 عرض معلومات شحن النقاط لجميع المستخدمين
+    if text == "🎯 شحن نقاطك":
         await update.message.reply_text(
-            f"💎 **شحن النقاط**\n\n"
-            f"لشراء أو شحن نقاط جديدة يرجى التواصل مع الدعم.\n\n"
-            f"👤 **معرف المسؤول:**\n@Ra11_8h\n\n"
-            f"أرسل له معرف حسابك داخل البوت وسيتم شحن رصيدك مباشرة:\n`{user_id}`",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            f"📥 **لتغذية وشحن حسابك بالنقاط:**\n\n"
+            f"يرجى التواصل مباشرة مع مالك البوت عبر المعرف التالي:\n"
+            f"📣 👤 المالك: @Ra11_8h\n\n"
+            f"قم بنسخ وإرسال معرف حسابك الرقمي للمالك لتفعيل النقاط فوراً: `{user_id}`",
             parse_mode="Markdown"
         )
         return
 
-    # 🔗 إرسال روابط
-    if text == "🔗 إرسال روابط":
-        db.close()
+    # 🔋 ميزة شحن النقاط للمستخدمين (خاصة بالمالك فقط)
+    if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
+        await update.message.reply_text("الرجاء إرسال معرف حساب المستخدم المراد شحن نقاطه (الـ User ID الرقمي):")
+        context.user_data['action'] = 'admin_charge_id'
+        return
+
+    # 📢 زر بدء إذاعة رسالة جديدة (خاص بالمالك فقط)
+    if text == "📢 إذاعة رسالة عامة" and user_id == ADMIN_ID:
         await update.message.reply_text(
-            "📥 وضع إرسال الروابط نشط الآن!\n"
-            "أرسل الروابط التي تريدها تباعاً. وعند الانتهاء اضغط على زر الحفظ بالأسفل.",
+            "📢 **وضع الإذاعة نشط الآن!**\n\n"
+            "أرسل الآن الرسالة التي تريد إرسالها لجميع مستخدمي البوت (يمكنك إرسال نص، تنسيقات، أو روابط):\n\n"
+            "*(أو أرسل /cancel إلغاء الإذاعة)*"
+        )
+        context.user_data['action'] = 'admin_broadcast'
+        return
+
+    # 👑 لوحة المطور الإدارية
+    if text == "👑 لوحة المطور" and user_id == ADMIN_ID:
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM accounts")
+        total_accounts = cursor.fetchone()[0]
+        cursor.execute("""
+            SELECT users.user_id, users.balance, COUNT(accounts.id) 
+            FROM users 
+            LEFT JOIN accounts ON users.user_id = accounts.user_id 
+            GROUP BY users.user_id
+        """)
+        details = cursor.fetchall()
+        
+        admin_reply = f"👑 **لوحة تحكم المطور الإدارية** 👑\n\n"
+        admin_reply += f"👥 إجمالي المستخدمين للبوت: {total_users}\n"
+        admin_reply += f"📱 إجمالي الأرقام المسجلة بالنظام: {total_accounts}\n\n"
+        admin_reply += "📋 تفاصيل المستخدمين والنقاط والأرقام:\n"
+        for u_id, bal, count in details:
+            admin_reply += f"• المستخدم (`{u_id}`): نقاطه ({bal} نقطة) | سجل ({count}) أرقام.\n"
+        await update.message.reply_text(admin_reply, parse_mode="Markdown")
+        return
+
+    elif text == "🔗 إرسال روابط":
+        await update.message.reply_text(
+            "📥 وضع الإرسال المفتوح والصامت نشط الآن!\n"
+            "قم بنسخ ولصق كافة الرسائل والروابط التي لديك هنا تباعاً وبأي عدد تريد.\n\n"
+            "📥 عند انتهائك تماماً من إرسال كل شيء، اضغط على زر **(📥 حفظ الروابط وإنهاء الإرسال)** بالأسفل ليظهر لك التقرير النهائي.",
             reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📥 حفظ الروابط وإنهاء الإرسال")]], resize_keyboard=True)
         )
         context.user_data['action'] = 'add_links'
         context.user_data['temp_links_list'] = []
         return
 
-    if text == "📥 حفظ الروابط وإنهاء الإرسال" and action == 'add_links':
-        temp_links = context.user_data.get('temp_links_list', [])
-        if temp_links:
-            for l in temp_links:
-                cursor.execute("INSERT INTO links (user_id, link) VALUES (?, ?)", (user_id, l))
-            db.commit()
-            await update.message.reply_text(f"✅ تم حفظ إجمالي ({len(temp_links)}) رابط في قائمتك بنجاح.")
-        else:
-            await update.message.reply_text("⚠️ لم تقم بإرسال أي روابط.")
-        db.close()
-        context.user_data.clear()
-        return await start(update, context)
-
-    # 🗑️ مسح الروابط
-    if text == "🗑️ مسح الروابط":
-        cursor.execute("DELETE FROM links WHERE user_id=?", (user_id,))
-        db.commit()
-        db.close()
-        await update.message.reply_text("🗑️ تم مسح جميع روابطك بنجاح.")
+    elif text == "📱 تسجيل الدخول الجديد":
+        await update.message.reply_text("الرجاء إرسال رقم الهاتف الجديد مع رمز الدولة (مثال: +966500000000):")
+        context.user_data['action'] = 'login_phone'
         return
-
-    # 📱 تسجيل الدخول الجديد (أو أرقامي المسجلة)
-    if text == "📱 تسجيل الدخول الجديد":
-        db.close()
-        context.user_data['action'] = 'waiting_phone'
-        await update.message.reply_text(
-            "📱 **تسجيل حساب جديد**\n\n"
-            "الرجاء إرسال رقم الهاتف مع رمز الدولة (مثال: `+9665xxxxxxxx`):",
-            parse_mode="Markdown"
-        )
-        return
-
-    if action == 'waiting_phone':
-        phone = text
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        try:
-            sent = await client.send_code_request(phone)
-            context.user_data['phone'] = phone
-            context.user_data['phone_code_hash'] = sent.phone_code_hash
-            context.user_data['client_session'] = client
-            context.user_data['action'] = 'waiting_code'
-            db.close()
-            await update.message.reply_text("📩 تم إرسال رمز التحقق إلى حسابك في تيليجرام.\nالرجاء إرسال الرمز هنا (افصل بين الأرقام بمسافات إن أمكن أو اكتبه مباشرة):")
-        except Exception as e:
-            db.close()
-            await update.message.reply_text(f"❌ حدث خطأ أثناء إرسال الكود: {e}")
-            context.user_data.clear()
-        return
-
-    if action == 'waiting_code':
-        code = text.replace(" ", "")
-        phone = context.user_data.get('phone')
-        phone_code_hash = context.user_data.get('phone_code_hash')
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        try:
-            await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-            session_string = client.session.save()
-            
-            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
-            cursor.execute("INSERT INTO accounts (user_id, session, phone, is_active) VALUES (?, ?, ?, 1)", (user_id, session_string, phone))
-            db.commit()
-            db.close()
-            
-            await update.message.reply_text("✅ تم تسجيل الدخول وتفعيل الرقم بنجاح تام!", reply_markup=get_main_keyboard(user_id, ADMIN_ID))
-            context.user_data.clear()
-        except Exception as e:
-            db.close()
-            if "2FA" in str(e) or "Password" in str(e):
-                context.user_data['action'] = 'waiting_2fa'
-                await update.message.reply_text("🔒 الحساب محمي التحقق بخطوتين (كلمة المرور).\nالرجاء إرسال كلمة المرور الآن:")
-            else:
-                await update.message.reply_text(f"❌ الكود غير صحيح أو حدث خطأ: {e}")
-        return
-
-    if action == 'waiting_2fa':
-        password = text
-        phone = context.user_data.get('phone')
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        try:
-            await client.sign_in(password=password)
-            session_string = client.session.save()
-            
-            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
-            cursor.execute("INSERT INTO accounts (user_id, session, phone, is_active) VALUES (?, ?, ?, 1)", (user_id, session_string, phone))
-            db.commit()
-            db.close()
-            
-            await update.message.reply_text("✅ تم التحقق بكلمة المرور وتفعيل الحساب بنجاح!", reply_markup=get_main_keyboard(user_id, ADMIN_ID))
-            context.user_data.clear()
-        except Exception as e:
-            db.close()
-            await update.message.reply_text(f"❌ كلمة المرور غير صحيحة: {e}")
-        return
-
-    # 📱 أرقامي المسجلة
-    if text == "📱 أرقامي المسجلة":
-        cursor.execute("SELECT id, phone, is_active FROM accounts WHERE user_id=?", (user_id,))
-        accs = cursor.fetchall()
-        db.close()
-        if not accs:
-            return await update.message.reply_text("⚠️ لا توجد أرقام مسجلة لديك.")
-        msg = "📱 **أرقامك المسجلة:**\n\n"
-        for aid, ph, active in accs:
-            status = "🟢 (مفعل حالياً)" if active == 1 else "⚪ (غير مفعل)"
-            msg += f"• الرقم: `{ph}` -- {status}\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        return
-
-    # 🗑️ حذف رقم مسجل
-    if text == "🗑️ حذف رقم مسجل":
-        cursor.execute("SELECT id, phone FROM accounts WHERE user_id=?", (user_id,))
-        accs = cursor.fetchall()
-        db.close()
-        if not accs:
-            return await update.message.reply_text("⚠️ لا توجد أرقام لحذفها.")
-        keyboard = [[InlineKeyboardButton(f"حذف: {ph}", callback_data=f"del_acc_{aid}")] for aid, ph in accs]
-        await update.message.reply_text("اختر الرقم الذي تريد حذفه:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # 📊 حالة النظام
-    if text == "📊 حالة النظام":
-        cursor.execute("SELECT COUNT(*) FROM links WHERE user_id=? AND status='pending'", (user_id,))
-        pending_count = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM links WHERE user_id=? AND status='completed'", (user_id,))
-        completed_count = cursor.fetchone()[0]
-        cursor.execute("SELECT phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
-        active_acc = cursor.fetchone()
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        bal = cursor.fetchone()[0]
-        db.close()
+    
+    elif text == "📱 أرقامي المسجلة":
+        cursor.execute("SELECT phone, is_active FROM accounts WHERE user_id=?", (user_id,))
+        accounts = cursor.fetchall()
+        if not accounts:
+            return await update.message.reply_text("❌ ليس لديك أي أرقام مسجلة حالياً. اضغط على (تسجيل الدخول الجديد).")
         
-        act_ph = active_acc[0] if active_acc else "لا يوجد"
-        bal_str = "المشرف (مفتوح)" if user_id == ADMIN_ID else f"{bal} نقطة"
-        
-        await update.message.reply_text(
-            f"📊 **حالة النظام الخاصة بك:**\n\n"
-            f"📱 الرقم المفعل: `{act_ph}`\n"
-            f"🔗 روابط بالانتظار: {pending_count}\n"
-            f"✅ روابط اكتملت: {completed_count}\n"
-            f"🎯 رصيدك: {bal_str}",
-            parse_mode="Markdown"
-        )
+        reply = "📱 الحسابات المرتبطة بك:\n\n"
+        for phone, is_active in accounts:
+            status = "🟢 [نشط ومستخدم حالياً]" if is_active == 1 else "⚪ [غير نشط]"
+            reply += f"• {phone} {status}\n"
+        reply += "\n🔄 للتبديل وتفعيل أي رقم, أرسل رقم الهاتف المراد تفعيله مباشرة كاملاً من القائمة:"
+        context.user_data['action'] = 'switch_account'
+        await update.message.reply_text(reply)
         return
 
-    # ⏱️ الوقت بين الانضمامات
-    if text == "⏱️ الوقت بين الانضمامات":
-        db.close()
+    elif text == "🗑️ حذف رقم مسجل":
+        cursor.execute("SELECT phone FROM accounts WHERE user_id=?", (user_id,))
+        accounts = cursor.fetchall()
+        if not accounts:
+            return await update.message.reply_text("❌ لا توجد أرقام مسجلة لحذفها.")
+        
+        reply = "🗑️ اختر الرقم المراد حذفه نهائياً من النظام وأرسله كاملاً:\n\n"
+        for (phone,) in accounts:
+            reply += f"• {phone}\n"
+        context.user_data['action'] = 'delete_account'
+        await update.message.reply_text(reply)
+        return
+
+    elif text == "⏱️ تحديد الوقت":
+        cursor.execute("SELECT delay FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        current_delay = row[0] if row else 10
+        await update.message.reply_text(f"⏱️ الوقت الحالي هو: {current_delay} ثانية.\nأرسل الوقت الجديد بالثواني مباشرة:")
         context.user_data['action'] = 'set_delay'
-        await update.message.reply_text("⏱️ أرسل الآن عدد الثواني المطلوبة للانتظار بين كل عملية انضمام (مثال: `10`):")
         return
 
-    if action == 'set_delay':
-        try:
-            d_val = int(text)
-            cursor.execute("UPDATE users SET delay=? WHERE user_id=?", (d_val, user_id))
-            db.commit()
-            db.close()
-            context.user_data.clear()
-            await update.message.reply_text(f"✅ تم تحديث الوقت بين الانضمامات إلى {d_val} ثانية.")
-        except:
-            db.close()
-            await update.message.reply_text("⚠️ يرجى إرسال رقم صحيح بالثواني.")
+    elif text == "💤 استراحة كل 5 روابط":
+        await update.message.reply_text("كم الوقت الي تحب فيه البوت يسترح بعد الانضمام ل 5 روابط (قم بكتابة عدد الدقائق بالرقم مباشرة)؟")
+        context.user_data['action'] = 'set_rest_time'
         return
-
-    # 💤 استراحة كل 5 روابط
-    if text == "💤 استراحة كل 5 روابط":
-        db.close()
-        context.user_data['action'] = 'set_rest'
-        await update.message.reply_text("💤 أرسل عدد دقائق الاستراحة بعد كل 5 روابط (مثال: `5`):")
-        return
-
-    if action == 'set_rest':
-        try:
-            r_val = int(text)
-            cursor.execute("UPDATE users SET rest_time=? WHERE user_id=?", (r_val, user_id))
-            db.commit()
-            db.close()
-            context.user_data.clear()
-            await update.message.reply_text(f"✅ تم تحديث وقت الاستراحة إلى {r_val} دقائق.")
-        except:
-            db.close()
-            await update.message.reply_text("⚠️ يرجى إرسال رقم صحيح بالدقائق.")
-        return
-
-    # 🛑 إيقاف الانضمام
-    if text == "🛑 إيقاف الانضمام":
-        running_states[user_id] = False
-        db.close()
-        await update.message.reply_text("🛑 تم إيقاف عملية الانضمام بنجاح.")
-        return
-
-    # لوحة المطور والمشرف
-    if user_id == ADMIN_ID:
-        if text == "👑 لوحة المطور":
-            cursor.execute("SELECT COUNT(*) FROM users")
-            u_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM accounts")
-            a_count = cursor.fetchone()[0]
-            db.close()
-            await update.message.reply_text(
-                f"👑 **لوحة تحكم المشرف العام:**\n\n"
-                f"👥 إجمالي المستخدمين: {u_count}\n"
-                f"📱 إجمالي الحسابات المسجلة: {a_count}",
-                parse_mode="Markdown"
-            )
-            return
-
-        if text == "🔋 شحن نقاط لمعلم":
-            db.close()
-            context.user_data['action'] = 'admin_add_points'
-            await update.message.reply_text("🔋 أرسل آيدي المستخدم وعدد النقاط بهذه الفراغات:\n`USER_ID POINTS`\n(مثال: `123456789 50`)", parse_mode="Markdown")
-            return
-
-        if action == 'admin_add_points':
-            try:
-                parts = text.split()
-                target_uid = int(parts[0])
-                points = int(parts[1])
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (points, target_uid))
-                db.commit()
-                db.close()
-                context.user_data.clear()
-                await update.message.reply_text(f"✅ تم شحن {points} نقطة للمستخدم `{target_uid}` بنجاح.", parse_mode="Markdown")
-            except Exception as e:
-                db.close()
-                await update.message.reply_text(f"❌ خطأ بالصيغة: {e}")
-            return
-
-        if text == "📢 إذاعة رسالة عامة":
-            db.close()
-            context.user_data['action'] = 'broadcast'
-            await update.message.reply_text("📢 أرسل النص أو الرسالة التي تريد إذاعتها لجميع المستخدمين:")
-            return
-
-        if action == 'broadcast':
-            cursor.execute("SELECT user_id FROM users")
-            all_users = cursor.fetchall()
-            db.close()
-            context.user_data.clear()
-            
-            sent_count = 0
-            for (u_id,) in all_users:
-                try:
-                    await context.bot.send_message(chat_id=u_id, text=f"📢 **إعلان إداري:**\n\n{text}", parse_mode="Markdown")
-                    sent_count += 1
-                except:
-                    pass
-            await update.message.reply_text(f"✅ تم إرسال الإذاعة بنجاح إلى ({sent_count}) مستخدم.")
-            return
-
-    found_links = extract_links(text)
-    if found_links and action != 'add_links':
-        for fl in found_links:
-            cursor.execute("INSERT INTO links (user_id, link) VALUES (?, ?)", (user_id, fl))
-        db.commit()
-        db.close()
         
-        if user_id != ADMIN_ID:
-            links_text = "\n".join(found_links)
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"🚨 **تنبيه: وصلتك روابط جديدة من مستخدم!**\n\n"
-                         f"👤 **آيدي المستخدم:** `{user_id}`\n"
-                         f"🔗 **الروابط المرسلة:**\n{links_text}",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-                
-        await update.message.reply_text("✅ تم استلام روابطك بنجاح وتوجيهها للمسؤول للمتابعة والتنفيذ.")
-        return
+    elif text == "🚀 بدء الانضمام":
+        if running_states.get(user_id) == True:
+            return await update.message.reply_text("⚠️ النظام قيد العمل بالفعل حالياً الخاص بك!")
 
-    if text == "🚀 بدء الانضمام":
         cursor.execute("SELECT id, link FROM links WHERE user_id=? AND status='pending'", (user_id,))
         links = cursor.fetchall()
         if not links: 
-            db.close()
-            return await update.message.reply_text("⚠️ لا توجد روابط في الانتظار.")
+            return await update.message.reply_text("⚠️ لا توجد روابط جديدة في الانتظار للعمل عليها.")
             
+        # 🧾 التحقق من رصيد النقاط الكافي للمستخدمين
+        if user_id != ADMIN_ID:
+            cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+            current_balance = cursor.fetchone()[0]
+            required_cost = len(links) # نقطة لكل رابط
+            
+            if current_balance < required_cost:
+                return await update.message.reply_text(
+                    f"❌ عذراً! رصيدك من النقاط لا يكفي لتشغيل هذه العملية.\n\n"
+                    f"📦 عدد الروابط المطلوب تشغيلها: {len(links)} رابط.\n"
+                    f"🎯 النقاط المطلوبة: {required_cost} نقطة\n"
+                    f"💳 رصيدك الحالي: {current_balance} نقطة\n\n"
+                    f"يرجى الضغط على زر (🎯 شحن نقاطك) لتعبئة الحساب والمتابعة."
+                )
+
         cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
         active_acc = cursor.fetchone()
         if not active_acc:
-            db.close()
-            return await update.message.reply_text("❌ يرجى تفعيل حساب أو رقم أولاً.")
-            
+            return await update.message.reply_text("❌ لا يوجد حساب نشط حالياً! يرجى اختيار وتفعيل حساب من قائمة (📱 أرقامي المسجلة) أولاً.")
+        
         cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
         user_conf = cursor.fetchone()
-        db.close()
+        delay_time = user_conf[0] if user_conf else 10
+        rest_time_minutes = user_conf[1] if (user_conf and len(user_conf) > 1 and user_conf[1] is not None) else 5
         
         running_states[user_id] = True
-        await update.message.reply_text("🚀 جاري بدء عملية الانضمام في الخلفية...")
-        asyncio.create_task(background_task(user_id, context, active_acc, user_conf[0], user_conf[1], links))
+        await update.message.reply_text(f"🚀 تم التحقق من النقاط وإطلاق مهمتك بنجاح لـ {len(links)} رابط في الخلفية بالتوازي!")
+        
+        asyncio.create_task(background_join_task(user_id, context, active_acc, delay_time, rest_time_minutes, links))
         return
 
-    db.close()
+    elif text == "🛑 إيقاف الانضمام":
+        running_states[user_id] = False
+        await update.message.reply_text("⏳ جاري إيقاف عملية الانضمام الخاصة بك فوراً...")
+        return
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-    
-    if data.startswith("del_acc_"):
-        acc_id = int(data.split("_")[2])
-        db = get_connection()
-        cursor = db.cursor()
-        cursor.execute("DELETE FROM accounts WHERE id=? AND user_id=?", (acc_id, user_id))
+    elif text == "🗑️ مسح الروابط":
+        cursor.execute("DELETE FROM links WHERE user_id=?", (user_id,))
         db.commit()
-        db.close()
-        await query.edit_message_text("🗑️ تم حذف الرقم بنجاح.")
+        await update.message.reply_text("🗑️ تم تفريغ ومسح قائمة الروابط.")
+        return
+        
+    elif text == "📊 حالة النظام":
+        cursor.execute("SELECT count(*) FROM links WHERE user_id=? AND status='pending'", (user_id,))
+        pending = cursor.fetchone()[0]
+        cursor.execute("SELECT phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
+        active_p = cursor.fetchone()
+        active_p = active_p[0] if active_p else "لا يوجد"
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        user_bal = cursor.fetchone()[0]
+        
+        bal_str = "المشرف (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{user_bal} نقطة"
+        is_running = "🔥 يعمل حالياً في الخلفية" if running_states.get(user_id) == True else "⚪ متوقف حالياً"
+        
+        await update.message.reply_text(
+            f"📋 **حالة النظام الحالية الخاصة بك:**\n\n"
+            f" وضع العمل: {is_running}\n"
+            f"🎯 رصيد نقاطك: {bal_str}\n"
+            f"📱 الرقم النشط حالياً: {active_p}\n"
+            f"⏳ روابط في الانتظار: {pending}"
+        )
+        return
+
+    # --- إدارة الخطوات الداخلية والمدخلات الفردية ---
+    if action == 'add_links':
+        found = extract_links(text)
+        if found:
+            if 'temp_links_list' not in context.user_data:
+                context.user_data['temp_links_list'] = []
+            context.user_data['temp_links_list'].extend(found)
+        return
+
+    # تنفيذ الإذاعة لجميع مستخدمي البوت
+    elif action == 'admin_broadcast' and user_id == ADMIN_ID:
+        if text == "/cancel":
+            context.user_data.clear()
+            return await update.message.reply_text("❌ تم إلغاء عملية الإذاعة.")
+            
+        cursor.execute("SELECT user_id FROM users")
+        all_users = cursor.fetchall()
+        
+        success_count = 0
+        fail_count = 0
+        
+        await update.message.reply_text(f"🚀 جاري إرسال الرسالة إلى ({len(all_users)}) مستخدم، يرجى الانتظار...")
+        
+        for (u_id,) in all_users:
+            try:
+                await context.bot.send_message(chat_id=u_id, text=text)
+                success_count += 1
+                await asyncio.sleep(0.05) # تجنب حظر تليجرام للإرسال السريع
+            except Exception:
+                fail_count += 1
+                
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ **تمت الإذاعة بنجاح!**\n\n"
+            f"📤 وصلت إلى: {success_count} مستخدم\n"
+            f"❌ فشل الوصول إليهم (حظروا البوت): {fail_count} مستخدم"
+        )
+        return
+
+    # خطوة المالك الأولى: استقبال آيدي الشخص المراد شحن نقاطه
+    elif action == 'admin_charge_id' and user_id == ADMIN_ID:
+        try:
+            target_user_id = int(text)
+            context.user_data['target_charge_id'] = target_user_id
+            await update.message.reply_text(f"🔋 تم تحديد المستخدم: `{target_user_id}`\nالآن أرسل عدد النقاط المراد إضافتها (رقم صحيح مثل: 50 أو 100):", parse_mode="Markdown")
+            context.user_data['action'] = 'admin_charge_amount'
+        except ValueError:
+            await update.message.reply_text("❌ عذراً، يجب إدخال آيدي رقمي صحيح.")
+            context.user_data.clear()
+        return
+
+    # خطوة المالك الثانية: شحن عدد النقاط المحدد في قاعدة البيانات
+    elif action == 'admin_charge_amount' and user_id == ADMIN_ID:
+        try:
+            amount = int(text)
+            target_id = context.user_data.get('target_charge_id')
+            
+            cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (target_id,))
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target_id))
+            db.commit()
+            
+            # جلب رصيد النقاط الجديد لتأكيد الشحن
+            cursor.execute("SELECT balance FROM users WHERE user_id=?", (target_id,))
+            new_total = cursor.fetchone()[0]
+            
+            await update.message.reply_text(f"✅ تم إضافة {amount} نقطة بنجاح للحساب `{target_id}`.\n🎯 إجمالي نقاطه الحالية أصبح: {new_total} نقطة", parse_mode="Markdown")
+            
+            # إرسال إشعار للمستخدم المستهدف مباشرة لإعلامه بتعبئة نقاطه
+            try:
+                await context.bot.send_message(chat_id=target_id, text=f"🎉 بشرى سارة! قام مالك المنصة بشحن رصيدك بـ: {amount} نقطة 🎯\n💰 رصيدك الكلي الحالي هو: {new_total} نقطة")
+            except Exception:
+                pass
+                
+        except ValueError:
+            await update.message.reply_text("❌ عذراً، يجب إرسال رقم صحيح للنقاط (مثال: 50 أو 100).")
+        context.user_data.clear()
+        return
+
+    elif action == 'switch_account':
+        cursor.execute("SELECT id FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+        acc = cursor.fetchone()
+        if acc:
+            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
+            cursor.execute("UPDATE accounts SET is_active=1 WHERE user_id=? AND phone=?", (user_id, text))
+            db.commit()
+            await update.message.reply_text(f"✅ تم تغيير الحساب النشط بنجاح إلى: {text}")
+        else:
+            await update.message.reply_text("❌ هذا الرقم غير موجود في قائمتك.")
+        context.user_data.clear()
+        return
+
+    elif action == 'delete_account':
+        cursor.execute("SELECT id, is_active FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+        acc = cursor.fetchone()
+        if acc:
+            cursor.execute("DELETE FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+            if acc[1] == 1:
+                cursor.execute("UPDATE accounts SET is_active=1 WHERE id=(SELECT id FROM accounts WHERE user_id=? LIMIT 1)", (user_id,))
+            db.commit()
+            await update.message.reply_text(f"🗑️ تم حذف الرقم {text} نهائياً.")
+        else:
+            await update.message.reply_text("❌ لم يتم العثور على هذا الرقم.")
+        context.user_data.clear()
+        return
+
+    elif action == 'set_delay':
+        try:
+            new_delay = int(text)
+            if new_delay < 1: raise ValueError
+            cursor.execute("UPDATE users SET delay=? WHERE user_id=?", (new_delay, user_id))
+            db.commit()
+            await update.message.reply_text(f"✅ تم تحديث الوقت إلى: {new_delay} ثانية.")
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إرسال رقم صحيح.")
+        context.user_data.clear()
+        return
+
+    elif action == 'set_rest_time':
+        try:
+            new_rest = int(text)
+            if new_rest < 0: raise ValueError
+            cursor.execute("UPDATE users SET rest_time=? WHERE user_id=?", (new_rest, user_id))
+            db.commit()
+            await update.message.reply_text("تم حفظ وقت الاستراحة بنجاح.")
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إرسال رقم دقائق صحيح.")
+        context.user_data.clear()
+        return
+
+    elif action == 'login_phone':
+        context.user_data['temp_phone'] = text
+        await update.message.reply_text("⏳ جاري إرسال كود التحقق للحساب...\nأرسل الكود فور وصوله:")
+        try:
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            send_code = await client.send_code_request(text)
+            context.user_data['phone_code_hash'] = send_code.phone_code_hash
+            context.user_data['client_obj'] = client
+            context.user_data['action'] = 'login_otp'
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ: {str(e)}")
+            context.user_data.clear()
+            
+    elif action == 'login_otp':
+        phone = context.user_data.get('temp_phone')
+        phone_code_hash = context.user_data.get('phone_code_hash')
+        client = context.user_data.get('client_obj')
+        try:
+            await client.sign_in(phone, text, phone_code_hash=phone_code_hash)
+            session_str = client.session.save()
+            
+            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
+            cursor.execute("INSERT INTO accounts (user_id, session, phone, is_active) VALUES (?, ?, ?, 1)", (user_id, session_str, phone))
+            db.commit()
+            await update.message.reply_text(f"🎉 ممتاز! تم إضافة الرقم {phone} وتفعيله بنجاح.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ في الكود: {str(e)}")
+        finally:
+            if client: await client.disconnect()
+            context.user_data.clear()
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    print("🚀 تم تشغيل البوت الاحترافي بنجاح...")
+    print("🚀 تم تشغيل البوت المطور بالكامل بنظام النقاط والإذاعة لمنصة مَدّ الطبية...")
     app.run_polling()
