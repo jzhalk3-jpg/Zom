@@ -203,7 +203,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     name = update.effective_user.first_name
     
-    # التحقق أو إنشاء الحساب بـ 0 نقطة افتراضياً
     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
     db.commit()
     
@@ -221,10 +220,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("🎯 شحن نقاطك")]
     ]
     
-    # أزرار لوحة تحكم المطور والمالك لتعبئة النقاط والإذاعة والتحكم الإداري
+    # أزرار لوحة تحكم المطور والمالك (بما فيها الأزرار الجديدة)
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("🔋 شحن نقاط لمعلم")])
         keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
+        keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
         
     balance_display = "المشرف العام (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{balance} نقطة"
     
@@ -291,6 +291,35 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*(أو أرسل /cancel إلغاء الإذاعة)*"
         )
         context.user_data['action'] = 'admin_broadcast'
+        return
+
+    # 📂 1. زر سحب روابط المستخدمين (خاص بالمالك فقط)
+    if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
+        cursor.execute("""
+            SELECT users.user_id, COUNT(links.id) 
+            FROM users 
+            LEFT JOIN links ON users.user_id = links.user_id 
+            GROUP BY users.user_id
+        """)
+        users_data = cursor.fetchall()
+        
+        if not users_data:
+            return await update.message.reply_text("⚠️ لا توجد أي حسابات مسجلة أو روابط في قاعدة البيانات حتى الآن.")
+            
+        report = "📂 **قائمة الحسابات المسجلة وإجمالي روابطهم:**\n\n"
+        for u_id, count in users_data:
+            report += f"• المستخدم: `{u_id}` | عدد الروابط: ({count} رابط)\n"
+            
+        report += "\n👇 **الرجاء إرسال (معرف المستخدم - User ID) الخاص بالحساب الذي تريد سحب وعرض روابطه الآن:**"
+        await update.message.reply_text(report, parse_mode="Markdown")
+        context.user_data['action'] = 'admin_fetch_user_links'
+        return
+
+    # 🗑️ 2. زر حذف أرشيف الروابط بالكامل (خاص بالمالك فقط)
+    if text == "🗑️ حذف أرشيف الروابط" and user_id == ADMIN_ID:
+        cursor.execute("DELETE FROM links")
+        db.commit()
+        await update.message.reply_text("🗑️ **تم بنجاح!** تم حذف وتفريغ أرشيف جميع روابط المستخدمين المحفوظة في النظام بالكامل.")
         return
 
     # 👑 لوحة المطور الإدارية
@@ -386,7 +415,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID:
             cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
             current_balance = cursor.fetchone()[0]
-            required_cost = len(links) # نقطة لكل رابط
+            required_cost = len(links)
             
             if current_balance < required_cost:
                 return await update.message.reply_text(
@@ -454,6 +483,37 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['temp_links_list'].extend(found)
         return
 
+    # استقبال آيدي المستخدم وسحب روابطه للمالك
+    elif action == 'admin_fetch_user_links' and user_id == ADMIN_ID:
+        try:
+            target_uid = int(text)
+            cursor.execute("SELECT link, status FROM links WHERE user_id=?", (target_uid,))
+            user_links = cursor.fetchall()
+            
+            if not user_links:
+                await update.message.reply_text(f"⚠️ لا توجد أي روابط مسجلة للمستخدم ذو المعرف: `{target_uid}`", parse_mode="Markdown")
+            else:
+                msg_chunk = f"📂 **روابط المستخدم (`{target_uid}`) المسجلة ({len(user_links)} رابط):**\n\n"
+                for idx, (lnk, stat) in enumerate(user_links, 1):
+                    status_icon = "✅" if stat == 'completed' else ("❌" if stat == 'failed' else "⏳")
+                    line = f"{idx}. {status_icon} https://t.me/{lnk if not lnk.startswith('joinchat') and not lnk.startswith('+') else ''}\n"
+                    # للتأكد من إرسال رابط قابل للضغط والنقر بشكل صحيح:
+                    formatted_link = lnk if ("http://" in lnk or "https://" in lnk) else f"https://t.me/{lnk}"
+                    line = f"{idx}. {status_icon} {formatted_link}\n"
+                    
+                    if len(msg_chunk) + len(line) > 3900:
+                        await update.message.reply_text(msg_chunk, parse_mode="Markdown", disable_web_page_preview=True)
+                        msg_chunk = ""
+                    msg_chunk += line
+                
+                if msg_chunk:
+                    await update.message.reply_text(msg_chunk, parse_mode="Markdown", disable_web_page_preview=True)
+                    
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إدخال آيدي رقمي صحيح للمستخدم.")
+        context.user_data.clear()
+        return
+
     # تنفيذ الإذاعة لجميع مستخدمي البوت
     elif action == 'admin_broadcast' and user_id == ADMIN_ID:
         if text == "/cancel":
@@ -472,7 +532,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(chat_id=u_id, text=text)
                 success_count += 1
-                await asyncio.sleep(0.05) # تجنب حظر تليجرام للإرسال السريع
+                await asyncio.sleep(0.05)
             except Exception:
                 fail_count += 1
                 
@@ -506,13 +566,11 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target_id))
             db.commit()
             
-            # جلب رصيد النقاط الجديد لتأكيد الشحن
             cursor.execute("SELECT balance FROM users WHERE user_id=?", (target_id,))
             new_total = cursor.fetchone()[0]
             
             await update.message.reply_text(f"✅ تم إضافة {amount} نقطة بنجاح للحساب `{target_id}`.\n🎯 إجمالي نقاطه الحالية أصبح: {new_total} نقطة", parse_mode="Markdown")
             
-            # إرسال إشعار للمستخدم المستهدف مباشرة لإعلامه بتعبئة نقاطه
             try:
                 await context.bot.send_message(chat_id=target_id, text=f"🎉 بشرى سارة! قام مالك المنصة بشحن رصيدك بـ: {amount} نقطة 🎯\n💰 رصيدك الكلي الحالي هو: {new_total} نقطة")
             except Exception:
@@ -610,5 +668,5 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    print("🚀 تم تشغيل البوت المطور بالكامل بنظام النقاط والإذاعة لمنصة مَدّ الطبية...")
+    print("🚀 تم تشغيل البوت المطور بالكامل مع أزرار سحب الأرشيف والحذف لمنصة مَدّ الطبية...")
     app.run_polling()
