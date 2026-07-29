@@ -12,7 +12,7 @@ BOT_TOKEN = "8969957914:AAF33nKExvFFry5ImvGirDU4oYraLMX3tHc"
 API_ID = 39289901
 API_HASH = "a5dcef068387dd95705046f910d6cd48"
 
-# 👑 المطور والمالك الوحيد للنظام (منصة مَدّ الطبية)
+# 👑 المطور والمالك الوحيد للنظام
 ADMIN_ID = 5064913080
 
 logging.basicConfig(level=logging.INFO)
@@ -216,8 +216,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("🚀 بدء الانضمام"), KeyboardButton("🛑 إيقاف الانضمام")],
         [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
         [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
-        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
-        [KeyboardButton("🎯 شحن نقاطك")]
+        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")]
     ]
     
     # أزرار لوحة تحكم المطور والمالك (بما فيها الأزرار الجديدة)
@@ -229,7 +228,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance_display = "المشرف العام (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{balance} نقطة"
     
     await update.message.reply_text(
-        f"🙋‍♂️ أهلاً بك يا {name} في منصة مَدّ الطبية لإدارة الحسابات الموازية!\n\n"
+        f"🙋‍♂️ أهلاً بك يا {name} في بوت الانضمام التلقائي!\n\n"
         f"💳 **معرف حسابك الرقمي:** `{user_id}`\n"
         f"🎯 **رصيدك الحالي:** {balance_display}\n\n"
         f"📋 (تكلفة الانضمام للرابط الواحد هي نقطة واحدة فقط).\n"
@@ -265,17 +264,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         context.user_data.clear()
         return await start(update, context)
-
-    # 🎯 عرض معلومات شحن النقاط لجميع المستخدمين
-    if text == "🎯 شحن نقاطك":
-        await update.message.reply_text(
-            f"📥 **لتغذية وشحن حسابك بالنقاط:**\n\n"
-            f"يرجى التواصل مباشرة مع مالك البوت عبر المعرف التالي:\n"
-            f"📣 👤 المالك: @Ra11_8h\n\n"
-            f"قم بنسخ وإرسال معرف حسابك الرقمي للمالك لتفعيل النقاط فوراً: `{user_id}`",
-            parse_mode="Markdown"
-        )
-        return
 
     # 🔋 ميزة شحن النقاط للمستخدمين (خاصة بالمالك فقط)
     if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
@@ -423,7 +411,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📦 عدد الروابط المطلوب تشغيلها: {len(links)} رابط.\n"
                     f"🎯 النقاط المطلوبة: {required_cost} نقطة\n"
                     f"💳 رصيدك الحالي: {current_balance} نقطة\n\n"
-                    f"يرجى الضغط على زر (🎯 شحن نقاطك) لتعبئة الحساب والمتابعة."
+                    f"يرجى التواصل مع المالك @Ra11_8h لشحن رصيدك."
                 )
 
         cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
@@ -668,5 +656,5 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    print("🚀 تم تشغيل البوت المطور بالكامل مع أزرار سحب الأرشيف والحذف لمنصة مَدّ الطبية...")
+    print("🚀 تم تشغيل البوت المطور بالكامل مع أزرار سحب الأرشيف والحذف...")
     app.run_polling()
