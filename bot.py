@@ -216,7 +216,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("🚀 بدء الانضمام"), KeyboardButton("🛑 إيقاف الانضمام")],
         [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
         [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
-        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")]
+        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
+        [KeyboardButton("🎯 شحن نقاطك")]  # <--- تم إضافة هذا الزر
     ]
     
     # أزرار لوحة تحكم المطور والمالك (بما فيها الأزرار الجديدة)
@@ -264,6 +265,17 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         context.user_data.clear()
         return await start(update, context)
+
+    # 🎯 عرض معلومات شحن النقاط لجميع المستخدمين
+    if text == "🎯 شحن نقاطك":
+        await update.message.reply_text(
+            f"📥 **لتغذية وشحن حسابك بالنقاط:**\n\n"
+            f"يرجى التواصل مباشرة مع مالك البوت عبر المعرف التالي:\n"
+            f"📣 👤 المالك: @Ra11_8h\n\n"
+            f"قم بنسخ وإرسال معرف حسابك الرقمي للمالك لتفعيل النقاط فوراً: `{user_id}`",
+            parse_mode="Markdown"
+        )
+        return
 
     # 🔋 ميزة شحن النقاط للمستخدمين (خاصة بالمالك فقط)
     if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
