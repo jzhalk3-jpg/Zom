@@ -2,10 +2,12 @@ import sqlite3
 import asyncio
 import re
 import logging
-from telethon import TelegramClient, functions
+from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+import time
+import random
 
 # --- الإعدادات الأساسية ---
 BOT_TOKEN = "8969957914:AAF33nKExvFFry5ImvGirDU4oYraLMX3tHc"
@@ -55,6 +57,23 @@ CREATE TABLE IF NOT EXISTS links (
     FOREIGN KEY(folder_id) REFERENCES folders(id)
 )
 """)
+# جدول مهام النشر
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS publish_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    account_id INTEGER,
+    message_text TEXT,
+    media_type TEXT,      -- 'text', 'photo', 'video', 'document'
+    media_file_id TEXT,
+    caption TEXT,
+    targets TEXT,          -- تخزين قائمة المعرفات (chat_id) مفصولة بفواصل
+    delay_between INTEGER DEFAULT 30,
+    status TEXT DEFAULT 'pending',  -- pending, running, completed, stopped
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP
+)
+""")
 db.commit()
 
 # ترقية الجداول القديمة
@@ -64,7 +83,8 @@ try:
 except sqlite3.OperationalError:
     pass
 
-running_states = {}
+running_states = {}          # لحفظ حالة الانضمام
+publish_running = {}         # لحفظ حالة النشر (user_id -> task_id)
 
 def extract_links(text):
     pattern = r"(?:https?://)?(?:t\.me/|telegram\.me/)([a-zA-Z0-9_]+|joinchat/[a-zA-Z0-9_-]+|\+[a-zA-Z0-9_-]+)"
@@ -91,6 +111,42 @@ def delete_folder_and_links(folder_id):
     cursor.execute("DELETE FROM links WHERE folder_id=?", (folder_id,))
     cursor.execute("DELETE FROM folders WHERE id=?", (folder_id,))
     db.commit()
+
+# ========== دوال الحصول على مجموعات الحساب ==========
+async def get_account_chats(session_str):
+    """جلب قائمة المجموعات (القنوات والمجموعات) التي انضم لها الحساب"""
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await client.connect()
+        dialogs = await client.get_dialogs()
+        chats = []
+        for d in dialogs:
+            # تصفية ليشمل فقط القنوات والمجموعات العامة والخاصة التي هو عضو فيها
+            if d.is_channel or d.is_group:
+                # نتأكد أنه عضو وليس محظوراً
+                try:
+                    # محاولة جلب المشاركين للتأكد من العضوية
+                    if d.is_channel:
+                        # محاولة جلب معلومات القناة
+                        entity = d.entity
+                        if hasattr(entity, 'username'):
+                            username = entity.username
+                        else:
+                            username = None
+                        chats.append({
+                            'id': d.id,
+                            'title': d.name,
+                            'username': username,
+                            'type': 'channel' if d.is_channel else 'group'
+                        })
+                except:
+                    continue
+        return chats
+    except Exception as e:
+        logging.error(f"Error fetching chats: {e}")
+        return []
+    finally:
+        await client.disconnect()
 
 # ========== منطق الانضمام ==========
 async def join_logic(session_str, link):
@@ -150,14 +206,13 @@ async def join_logic(session_str, link):
     finally:
         await client.disconnect()
 
-# ========== دالة الخلفية ==========
+# ========== دالة الخلفية للانضمام ==========
 async def background_join_task(user_id, context, active_acc, delay_time, rest_time_minutes, folder_id, folder_name):
     try:
         join_counter = 0
         local_db = sqlite3.connect("bot_final.db")
         local_cursor = local_db.cursor()
 
-        # جلب الروابط من المجلد المختار
         local_cursor.execute("SELECT id, link FROM links WHERE folder_id=? AND status='pending'", (folder_id,))
         links = local_cursor.fetchall()
         if not links:
@@ -168,7 +223,6 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
             if not running_states.get(user_id):
                 break
 
-            # تحقق الرصيد للمستخدمين العاديين
             if user_id != ADMIN_ID:
                 local_cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
                 current_bal = local_cursor.fetchone()[0]
@@ -176,7 +230,6 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                     await context.bot.send_message(chat_id=user_id, text="⚠️ نفدت نقاطك، يرجى شحنها.")
                     break
 
-            # استراحة كل 5 روابط
             if join_counter > 0 and join_counter % 5 == 0:
                 await context.bot.send_message(
                     chat_id=user_id,
@@ -210,7 +263,6 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                     await context.bot.send_message(chat_id=user_id, text="🔄 إعادة محاولة الانضمام...")
                     continue
 
-                # تحديث حالة الرابط
                 local_cursor.execute("UPDATE links SET status=? WHERE id=?", ('completed' if status == "SUCCESS" else 'failed', lid))
                 if user_id != ADMIN_ID:
                     local_cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (user_id,))
@@ -228,7 +280,6 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                 )
                 break
 
-            # الانتظار بين الروابط
             for _ in range(int(delay_time * 10)):
                 if not running_states.get(user_id):
                     break
@@ -244,6 +295,72 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
         logging.error(f"Error in background task: {e}")
     finally:
         running_states[user_id] = False
+
+# ========== دالة النشر في المجموعات (خلفية) ==========
+async def background_publish_task(user_id, context, task_id, account_session, account_phone, targets, message_text, media_type, media_file_id, caption, delay_between):
+    try:
+        client = TelegramClient(StringSession(account_session), API_ID, API_HASH)
+        await client.connect()
+        me = await client.get_me()
+
+        # تحديث حالة المهمة إلى قيد التشغيل
+        cursor.execute("UPDATE publish_tasks SET status='running' WHERE id=?", (task_id,))
+        db.commit()
+
+        sent = 0
+        failed = 0
+
+        for chat_id in targets:
+            # التحقق من أن المهمة لم تتوقف
+            if not publish_running.get(user_id, False):
+                cursor.execute("UPDATE publish_tasks SET status='stopped' WHERE id=?", (task_id,))
+                db.commit()
+                await context.bot.send_message(user_id, "🛑 تم إيقاف النشر بناءً على طلبك.")
+                await client.disconnect()
+                return
+
+            try:
+                entity = await client.get_entity(int(chat_id))
+                if media_type == 'text':
+                    await client.send_message(entity, message_text)
+                elif media_type == 'photo' and media_file_id:
+                    await client.send_file(entity, media_file_id, caption=caption or message_text)
+                elif media_type == 'video' and media_file_id:
+                    await client.send_file(entity, media_file_id, caption=caption or message_text)
+                elif media_type == 'document' and media_file_id:
+                    await client.send_file(entity, media_file_id, caption=caption or message_text)
+                else:
+                    await client.send_message(entity, message_text)
+                sent += 1
+            except Exception as e:
+                logging.error(f"Publish failed to {chat_id}: {e}")
+                failed += 1
+
+            # تأخير بين الرسائل
+            await asyncio.sleep(delay_between)
+
+        # تحديث حالة المهمة إلى منتهية
+        cursor.execute("UPDATE publish_tasks SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE id=?", (task_id,))
+        db.commit()
+        await context.bot.send_message(
+            user_id,
+            f"✅ انتهى النشر بنجاح!\n"
+            f"📊 التقرير:\n"
+            f"• عدد المجموعات المستهدفة: {len(targets)}\n"
+            f"• تم الإرسال بنجاح: {sent}\n"
+            f"• فشل الإرسال: {failed}"
+        )
+        await client.disconnect()
+        publish_running[user_id] = False
+
+    except Exception as e:
+        logging.error(f"Error in publish task {task_id}: {e}")
+        cursor.execute("UPDATE publish_tasks SET status='failed' WHERE id=?", (task_id,))
+        db.commit()
+        await context.bot.send_message(user_id, f"❌ حدث خطأ أثناء النشر: {str(e)}")
+        publish_running[user_id] = False
+        if client:
+            await client.disconnect()
 
 # ========== دوال الأزرار ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -264,7 +381,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
         [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
         [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
-        [KeyboardButton("🎯 شحن نقاطك"), KeyboardButton("📁 مجلدات الروابط")]
+        [KeyboardButton("🎯 شحن نقاطك"), KeyboardButton("📁 مجلدات الروابط")],
+        [KeyboardButton("📢 نشر في المجموعات"), KeyboardButton("📊 تقارير النشر")]
     ]
 
     if user_id == ADMIN_ID:
@@ -284,6 +402,457 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+# ========== معالجة النشر ==========
+async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # التحقق من وجود أرقام مسجلة
+    cursor.execute("SELECT id, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
+    active_accounts = cursor.fetchall()
+    if not active_accounts:
+        await update.message.reply_text("❌ ليس لديك أي حساب نشط. قم بتسجيل الدخول أولاً.")
+        return
+
+    # إذا كان هناك حساب نشط واحد فقط، نستخدمه مباشرة
+    if len(active_accounts) == 1:
+        acc_id, phone = active_accounts[0]
+        context.user_data['publish_account_id'] = acc_id
+        context.user_data['publish_phone'] = phone
+        # جلب المجموعات
+        await show_account_chats(update, context, acc_id, phone)
+    else:
+        # عرض الأرقام لاختيار أي منها سيتم النشر
+        reply = "📱 اختر الحساب الذي ستستخدمه للنشر:\n"
+        buttons = []
+        for acc_id, phone in active_accounts:
+            buttons.append([InlineKeyboardButton(phone, callback_data=f"pub_acc_{acc_id}")])
+        buttons.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+        await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def show_account_chats(update, context, acc_id, phone):
+    user_id = update.effective_user.id
+    # جلب جلسة الحساب
+    cursor.execute("SELECT session FROM accounts WHERE id=?", (acc_id,))
+    row = cursor.fetchone()
+    if not row:
+        await update.message.reply_text("❌ خطأ في الحساب.")
+        return
+    session_str = row[0]
+    # جلب المجموعات
+    chats = await get_account_chats(session_str)
+    if not chats:
+        await update.message.reply_text("⚠️ لم يتم العثور على أي مجموعات أو قنوات هذا الحساب عضو فيها.")
+        return
+
+    # عرض قائمة المجموعات مع أزرار اختيار
+    context.user_data['publish_chats'] = chats
+    context.user_data['publish_account_id'] = acc_id
+    context.user_data['publish_phone'] = phone
+
+    reply = f"📢 الحساب: {phone}\nاختر المجموعات التي تريد النشر فيها (يمكنك اختيار عدة):\n"
+    # نرسل قائمة المجموعات على دفعات لأن عددها كبير
+    for chat in chats[:50]:  # حد أقصى 50 لتجنب التكدس
+        chat_id = chat['id']
+        title = chat['title'][:30]
+        username = f"@{chat['username']}" if chat['username'] else f"ID: {chat_id}"
+        await update.message.reply_text(
+            f"{title}\n{username}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ اختيار", callback_data=f"pub_select_{chat_id}")]
+            ])
+        )
+    # زر إنهاء الاختيار
+    await update.message.reply_text(
+        "بعد اختيار المجموعات المطلوبة، اضغط على 'بدء النشر'",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 بدء النشر", callback_data="pub_start")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]
+        ])
+    )
+    context.user_data['publish_selected'] = []
+
+# ========== دالة بدء النشر ==========
+async def start_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    selected = context.user_data.get('publish_selected', [])
+    if not selected:
+        await update.message.reply_text("⚠️ لم تختر أي مجموعة للنشر.")
+        return
+
+    acc_id = context.user_data.get('publish_account_id')
+    if not acc_id:
+        await update.message.reply_text("❌ خطأ: لم يتم تحديد حساب.")
+        return
+
+    # طلب النص أو الوسائط
+    await update.message.reply_text(
+        "📝 أرسل الآن النص الذي تريد نشره (يمكنك إرسال نص، صورة، فيديو، أو ملف).\n"
+        "إذا أرسلت وسائط، يمكنك إضافة تعليق (كابتشن) معها.\n"
+        "لإلغاء العملية أرسل /cancel"
+    )
+    context.user_data['action'] = 'publish_content'
+    context.user_data['publish_acc_id'] = acc_id
+
+# ========== معالجة رسائل النشر (نص أو وسائط) ==========
+async def handle_publish_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    action = context.user_data.get('action')
+    if action != 'publish_content':
+        return
+
+    # حفظ المحتوى
+    message = update.message
+    media_type = 'text'
+    media_file_id = None
+    caption = None
+
+    if message.photo:
+        media_type = 'photo'
+        media_file_id = message.photo[-1].file_id
+        caption = message.caption
+    elif message.video:
+        media_type = 'video'
+        media_file_id = message.video.file_id
+        caption = message.caption
+    elif message.document:
+        media_type = 'document'
+        media_file_id = message.document.file_id
+        caption = message.caption
+    else:
+        media_type = 'text'
+        message_text = message.text
+
+    # حفظ المحتوى في context
+    context.user_data['publish_media_type'] = media_type
+    context.user_data['publish_media_file_id'] = media_file_id
+    context.user_data['publish_caption'] = caption
+    if media_type == 'text':
+        context.user_data['publish_message_text'] = message.text
+
+    # طلب تأكيد وضبط التأخير
+    await update.message.reply_text(
+        "⏱️ أرسل عدد الثواني بين كل رسالة (مثال: 30 ثانية، يُفضل 60 أو أكثر لتجنب الحظر):"
+    )
+    context.user_data['action'] = 'publish_delay'
+
+# ========== معالجة تأخير النشر ==========
+async def handle_publish_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    action = context.user_data.get('action')
+    if action != 'publish_delay':
+        return
+
+    try:
+        delay = int(update.message.text)
+        if delay < 3:
+            await update.message.reply_text("⚠️ التأخير يجب أن يكون 3 ثوانٍ على الأقل.")
+            return
+        context.user_data['publish_delay'] = delay
+
+        # الآن نبدأ النشر
+        await start_publish_execution(update, context)
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح (ثواني).")
+
+async def start_publish_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # جلب جميع البيانات
+    acc_id = context.user_data.get('publish_acc_id')
+    selected = context.user_data.get('publish_selected', [])
+    media_type = context.user_data.get('publish_media_type', 'text')
+    media_file_id = context.user_data.get('publish_media_file_id')
+    caption = context.user_data.get('publish_caption')
+    message_text = context.user_data.get('publish_message_text', '')
+    delay = context.user_data.get('publish_delay', 30)
+
+    # جلب جلسة الحساب
+    cursor.execute("SELECT session, phone FROM accounts WHERE id=?", (acc_id,))
+    row = cursor.fetchone()
+    if not row:
+        await update.message.reply_text("❌ خطأ في الحساب.")
+        return
+    session_str, phone = row
+
+    # إنشاء مهمة في قاعدة البيانات
+    targets_str = ','.join(map(str, selected))
+    cursor.execute("""
+        INSERT INTO publish_tasks (user_id, account_id, message_text, media_type, media_file_id, caption, targets, delay_between)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, acc_id, message_text, media_type, media_file_id, caption, targets_str, delay))
+    db.commit()
+    task_id = cursor.lastrowid
+
+    # بدء المهمة في الخلفية
+    publish_running[user_id] = True
+    await update.message.reply_text(
+        f"🚀 بدء النشر إلى {len(selected)} مجموعة\n"
+        f"• التأخير: {delay} ثانية\n"
+        f"• الحساب: {phone}\n"
+        f"سيتم إرسال تقرير عند الانتهاء."
+    )
+
+    asyncio.create_task(
+        background_publish_task(
+            user_id,
+            context,
+            task_id,
+            session_str,
+            phone,
+            selected,
+            message_text,
+            media_type,
+            media_file_id,
+            caption,
+            delay
+        )
+    )
+    context.user_data.clear()
+
+# ========== تقارير النشر ==========
+async def publish_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cursor.execute("""
+        SELECT id, account_id, message_text, targets, status, created_at, completed_at
+        FROM publish_tasks
+        WHERE user_id=?
+        ORDER BY created_at DESC
+        LIMIT 10
+    """, (user_id,))
+    tasks = cursor.fetchall()
+    if not tasks:
+        await update.message.reply_text("📊 لا توجد مهام نشر سابقة.")
+        return
+
+    reply = "📊 **آخر مهام النشر:**\n\n"
+    for task in tasks:
+        tid, acc_id, msg, targets, status, created, completed = task
+        status_emoji = {
+            'pending': '⏳',
+            'running': '🔄',
+            'completed': '✅',
+            'stopped': '🛑',
+            'failed': '❌'
+        }.get(status, '❓')
+        # اختصار النص
+        msg_short = msg[:50] + "..." if len(msg) > 50 else msg
+        reply += f"{status_emoji} م {tid} - {status}\n"
+        reply += f"   إلى {len(targets.split(','))} مجموعة\n"
+        reply += f"   النص: {msg_short}\n"
+        reply += f"   أنشئت: {created}\n\n"
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+# ========== معالجة إيقاف النشر ==========
+async def stop_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if publish_running.get(user_id):
+        publish_running[user_id] = False
+        await update.message.reply_text("🛑 جاري إيقاف عملية النشر...")
+    else:
+        await update.message.reply_text("⚠️ لا توجد عملية نشر نشطة حالياً.")
+
+# ========== معالجة الكولباك ==========
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data == "cancel":
+        await query.edit_message_text("❌ تم الإلغاء.")
+        context.user_data.clear()
+        return
+
+    # اختيار حساب للنشر
+    if data.startswith("pub_acc_"):
+        acc_id = int(data.split("_")[2])
+        cursor.execute("SELECT phone, session FROM accounts WHERE id=?", (acc_id,))
+        row = cursor.fetchone()
+        if not row:
+            await query.edit_message_text("❌ الحساب غير موجود.")
+            return
+        phone, session_str = row
+        await query.edit_message_text(f"✅ تم اختيار الحساب: {phone}\nجاري جلب المجموعات...")
+        # جلب المجموعات
+        chats = await get_account_chats(session_str)
+        if not chats:
+            await query.edit_message_text("⚠️ لم يتم العثور على مجموعات.")
+            return
+        context.user_data['publish_chats'] = chats
+        context.user_data['publish_account_id'] = acc_id
+        context.user_data['publish_phone'] = phone
+        context.user_data['publish_selected'] = []
+
+        # عرض قائمة المجموعات
+        await query.message.reply_text(
+            f"📢 الحساب: {phone}\nاختر المجموعات التي تريد النشر فيها:"
+        )
+        # إرسال كل مجموعة كزر
+        for chat in chats[:50]:
+            chat_id = chat['id']
+            title = chat['title'][:30]
+            username = f"@{chat['username']}" if chat['username'] else f"ID:{chat_id}"
+            await query.message.reply_text(
+                f"{title}\n{username}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ اختيار", callback_data=f"pub_select_{chat_id}")]
+                ])
+            )
+        await query.message.reply_text(
+            "بعد الاختيار، اضغط 'بدء النشر'",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 بدء النشر", callback_data="pub_start")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]
+            ])
+        )
+        return
+
+    # اختيار مجموعة
+    if data.startswith("pub_select_"):
+        chat_id = int(data.split("_")[2])
+        selected = context.user_data.get('publish_selected', [])
+        if chat_id not in selected:
+            selected.append(chat_id)
+            context.user_data['publish_selected'] = selected
+            await query.edit_message_text(f"✅ تم اختيار المجموعة (ID: {chat_id})")
+        else:
+            await query.edit_message_text("⚠️ هذه المجموعة مضافة بالفعل.")
+        return
+
+    # بدء النشر
+    if data == "pub_start":
+        selected = context.user_data.get('publish_selected', [])
+        if not selected:
+            await query.edit_message_text("⚠️ لم تختر أي مجموعة.")
+            return
+        acc_id = context.user_data.get('publish_account_id')
+        if not acc_id:
+            await query.edit_message_text("❌ خطأ: لم يتم تحديد حساب.")
+            return
+        # طلب المحتوى
+        await query.edit_message_text(
+            "📝 أرسل الآن النص أو الوسائط التي تريد نشرها.\n"
+            "يمكنك إرسال صورة، فيديو، ملف، أو نص.\n"
+            "لإلغاء العملية أرسل /cancel"
+        )
+        context.user_data['action'] = 'publish_content'
+        context.user_data['publish_acc_id'] = acc_id
+        return
+
+    # ------ باقي الكولباكات القديمة (المجلدات) ------
+    if data.startswith("join_folder_"):
+        folder_id = int(data.split("_")[2])
+        cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
+        res = cursor.fetchone()
+        if not res:
+            await query.edit_message_text("⚠️ هذا المجلد غير موجود.")
+            return
+        folder_name = res[0]
+        context.user_data['selected_folder'] = folder_id
+        await query.edit_message_text(f"✅ تم اختيار المجلد: **{folder_name}**")
+        await start_joining_from_callback(update, context, user_id, folder_id, folder_name)
+        return
+
+    if data.startswith("select_folder_"):
+        folder_id = int(data.split("_")[2])
+        cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
+        res = cursor.fetchone()
+        if not res:
+            await query.edit_message_text("⚠️ المجلد غير موجود.")
+            return
+        folder_name = res[0]
+        links = get_folder_links(folder_id)
+        if not links:
+            await query.edit_message_text(f"📁 **{folder_name}**\nلا توجد روابط معلقة.")
+            return
+        reply = f"📁 **{folder_name}**\nروابط معلقة ({len(links)}):\n\n"
+        for idx, (lid, link, status) in enumerate(links, 1):
+            reply += f"{idx}. {link}\n"
+        await query.edit_message_text(reply, parse_mode="Markdown")
+        return
+
+    if data.startswith("delete_folder_"):
+        folder_id = int(data.split("_")[2])
+        cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
+        res = cursor.fetchone()
+        if not res:
+            await query.edit_message_text("⚠️ المجلد غير موجود.")
+            return
+        folder_name = res[0]
+        delete_folder_and_links(folder_id)
+        await query.edit_message_text(f"🗑️ تم حذف المجلد **{folder_name}** وجميع روابطه.")
+        return
+
+async def start_joining_from_callback(update, context, user_id, folder_id, folder_name):
+    links = get_folder_links(folder_id)
+    if not links:
+        await update.effective_message.reply_text("⚠️ لا توجد روابط معلقة في هذا المجلد.")
+        return
+
+    if user_id != ADMIN_ID:
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        bal = cursor.fetchone()[0]
+        if bal < len(links):
+            await update.effective_message.reply_text(
+                f"❌ رصيدك لا يكفي. تحتاج {len(links)} نقطة، لديك {bal} نقطة.\nتواصل مع @Ra11_8h للشحن."
+            )
+            return
+
+    cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
+    active_acc = cursor.fetchone()
+    if not active_acc:
+        await update.effective_message.reply_text("❌ لا يوجد حساب نشط. قم بتسجيل الدخول.")
+        return
+
+    cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
+    user_conf = cursor.fetchone()
+    delay_time = user_conf[0] if user_conf else 10
+    rest_time = user_conf[1] if user_conf and user_conf[1] is not None else 5
+
+    running_states[user_id] = True
+    await update.effective_message.reply_text(
+        f"🚀 بدء الانضمام من المجلد **{folder_name}** ({len(links)} رابط)..."
+    )
+
+    asyncio.create_task(
+        background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
+    )
+
+# ========== دالة البداية المباشرة (للمجلد الواحد) ==========
+async def start_joining(update, context, user_id, folder_id, folder_name):
+    links = get_folder_links(folder_id)
+    if not links:
+        await update.message.reply_text("⚠️ لا توجد روابط معلقة في هذا المجلد.")
+        return
+
+    if user_id != ADMIN_ID:
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        bal = cursor.fetchone()[0]
+        if bal < len(links):
+            await update.message.reply_text(
+                f"❌ رصيدك لا يكفي. تحتاج {len(links)} نقطة، لديك {bal} نقطة.\nتواصل مع @Ra11_8h للشحن."
+            )
+            return
+
+    cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
+    active_acc = cursor.fetchone()
+    if not active_acc:
+        await update.message.reply_text("❌ لا يوجد حساب نشط.")
+        return
+
+    cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
+    user_conf = cursor.fetchone()
+    delay_time = user_conf[0] if user_conf else 10
+    rest_time = user_conf[1] if user_conf and user_conf[1] is not None else 5
+
+    running_states[user_id] = True
+    await update.message.reply_text(
+        f"🚀 بدء الانضمام من المجلد **{folder_name}** ({len(links)} رابط)..."
+    )
+
+    asyncio.create_task(
+        background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
+    )
+
+# ========== دالة معالجة الرسائل الرئيسية ==========
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not update.message or not update.message.text:
@@ -297,6 +866,19 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "/start":
         return await start(update, context)
+
+    # ========== أزرار النشر ==========
+    if text == "📢 نشر في المجموعات":
+        await handle_publish(update, context)
+        return
+
+    if text == "📊 تقارير النشر":
+        await publish_reports(update, context)
+        return
+
+    if text == "🛑 إيقاف النشر":
+        await stop_publish(update, context)
+        return
 
     # ========== زر شحن النقاط ==========
     if text == "🎯 شحن نقاطك":
@@ -329,7 +911,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not temp_links:
             await update.message.reply_text("⚠️ لم ترسل أي روابط.")
         else:
-            # إنشاء مجلد جديد
             folder_id = create_folder(user_id)
             cursor.execute("SELECT folder_name FROM folders WHERE id=?", (folder_id,))
             folder_name = cursor.fetchone()[0]
@@ -363,13 +944,11 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ لا توجد مجلدات. أرسل روابط واحفظها أولاً.")
             return
 
-        # إذا كان هناك مجلد واحد فقط، استخدمه مباشرة
         if len(folders) == 1:
             folder_id, folder_name = folders[0]
             await start_joining(update, context, user_id, folder_id, folder_name)
             return
 
-        # عرض المجلدات للاختيار
         reply = "📁 **اختر المجلد الذي تريد الانضمام منه:**"
         keyboard = [[InlineKeyboardButton(fname, callback_data=f"join_folder_{fid}")] for fid, fname in folders]
         keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
@@ -382,21 +961,19 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ جاري الإيقاف...")
         return
 
-    # ========== زر حالة النظام (معدل) ==========
+    # ========== زر حالة النظام ==========
     if text == "📊 حالة النظام":
-        # قراءة الإعدادات من قاعدة البيانات
         cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
         row = cursor.fetchone()
         if row:
             delay, rest = row
         else:
-            delay, rest = 10, 5  # القيم الافتراضية
+            delay, rest = 10, 5
 
         cursor.execute("SELECT phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
         active_phone = cursor.fetchone()
         active_phone = active_phone[0] if active_phone else "لا يوجد"
 
-        # المجلد النشط (آخر مجلد تم اختياره)
         selected_folder = context.user_data.get('selected_folder')
         folder_name = "غير محدد"
         if selected_folder:
@@ -421,7 +998,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ========== زر مسح الروابط (حذف مجلد) ==========
+    # ========== زر مسح الروابط ==========
     if text == "🗑️ مسح الروابط":
         folders = get_user_folders(user_id)
         if not folders:
@@ -433,7 +1010,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # ========== زر تسجيل الدخول الجديد ==========
+    # ========== زر تسجيل الدخول ==========
     if text == "📱 تسجيل الدخول الجديد":
         await update.message.reply_text("أرسل رقم الهاتف مع رمز الدولة (مثال: +966500000000):")
         context.user_data['action'] = 'login_phone'
@@ -552,7 +1129,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['temp_links_list'].extend(found)
         return
 
-    # ========== معالجة تغيير الوقت ==========
     if action == 'set_delay':
         try:
             new_delay = int(text)
@@ -566,7 +1142,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== معالجة تغيير وقت الاستراحة ==========
     if action == 'set_rest_time':
         try:
             new_rest = int(text)
@@ -578,6 +1153,30 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ يرجى إرسال رقم صحيح (0 أو أكثر).")
         context.user_data.clear()
+        return
+
+    # ========== معالجة النشر (المحتوى والتأخير) ==========
+    if action == 'publish_content':
+        # سنتعامل معها في دوال منفصلة ولكن نمسكها هنا أيضاً لتغطية الرسائل النصية
+        if update.message.text and update.message.text != "/cancel":
+            context.user_data['publish_message_text'] = update.message.text
+            context.user_data['publish_media_type'] = 'text'
+            await update.message.reply_text(
+                "⏱️ أرسل عدد الثواني بين كل رسالة (مثال: 30 ثانية، يُفضل 60 أو أكثر):"
+            )
+            context.user_data['action'] = 'publish_delay'
+        return
+
+    if action == 'publish_delay':
+        try:
+            delay = int(text)
+            if delay < 3:
+                await update.message.reply_text("⚠️ التأخير يجب أن يكون 3 ثوانٍ على الأقل.")
+                return
+            context.user_data['publish_delay'] = delay
+            await start_publish_execution(update, context)
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إرسال رقم صحيح (ثواني).")
         return
 
     # ========== معالجة تسجيل الدخول ==========
@@ -636,7 +1235,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if acc:
             cursor.execute("DELETE FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
             if acc[1] == 1:
-                # تفعيل أول حساب آخر إن وجد
                 cursor.execute("SELECT id FROM accounts WHERE user_id=? LIMIT 1", (user_id,))
                 other = cursor.fetchone()
                 if other:
@@ -719,142 +1317,15 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # إذا لم يتطابق أي شيء، نرسل رسالة افتراضية
+    # إذا لم يتطابق أي شيء
     await update.message.reply_text("⚠️ زر غير معروف أو حدث خطأ، يرجى استخدام الأزرار المتاحة.")
-
-# ========== دوال الـ Callback ==========
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = update.effective_user.id
-
-    if data == "cancel":
-        await query.edit_message_text("❌ تم الإلغاء.")
-        return
-
-    # اختيار مجلد للانضمام
-    if data.startswith("join_folder_"):
-        folder_id = int(data.split("_")[2])
-        cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
-        res = cursor.fetchone()
-        if not res:
-            await query.edit_message_text("⚠️ هذا المجلد غير موجود.")
-            return
-        folder_name = res[0]
-        context.user_data['selected_folder'] = folder_id
-        await query.edit_message_text(f"✅ تم اختيار المجلد: **{folder_name}**")
-        # بدء الانضمام
-        await start_joining_from_callback(update, context, user_id, folder_id, folder_name)
-
-    # اختيار مجلد للعرض (مجلدات الروابط)
-    elif data.startswith("select_folder_"):
-        folder_id = int(data.split("_")[2])
-        cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
-        res = cursor.fetchone()
-        if not res:
-            await query.edit_message_text("⚠️ المجلد غير موجود.")
-            return
-        folder_name = res[0]
-        links = get_folder_links(folder_id)
-        if not links:
-            await query.edit_message_text(f"📁 **{folder_name}**\nلا توجد روابط معلقة.")
-            return
-        reply = f"📁 **{folder_name}**\nروابط معلقة ({len(links)}):\n\n"
-        for idx, (lid, link, status) in enumerate(links, 1):
-            reply += f"{idx}. {link}\n"
-        await query.edit_message_text(reply, parse_mode="Markdown")
-
-    # حذف مجلد
-    elif data.startswith("delete_folder_"):
-        folder_id = int(data.split("_")[2])
-        cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
-        res = cursor.fetchone()
-        if not res:
-            await query.edit_message_text("⚠️ المجلد غير موجود.")
-            return
-        folder_name = res[0]
-        delete_folder_and_links(folder_id)
-        await query.edit_message_text(f"🗑️ تم حذف المجلد **{folder_name}** وجميع روابطه.")
-
-async def start_joining_from_callback(update, context, user_id, folder_id, folder_name):
-    # التحقق من وجود روابط في المجلد
-    links = get_folder_links(folder_id)
-    if not links:
-        await update.effective_message.reply_text("⚠️ لا توجد روابط معلقة في هذا المجلد.")
-        return
-
-    # التحقق من الرصيد
-    if user_id != ADMIN_ID:
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        bal = cursor.fetchone()[0]
-        if bal < len(links):
-            await update.effective_message.reply_text(
-                f"❌ رصيدك لا يكفي. تحتاج {len(links)} نقطة، لديك {bal} نقطة.\nتواصل مع @Ra11_8h للشحن."
-            )
-            return
-
-    # التحقق من الحساب النشط
-    cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
-    active_acc = cursor.fetchone()
-    if not active_acc:
-        await update.effective_message.reply_text("❌ لا يوجد حساب نشط. قم بتسجيل الدخول.")
-        return
-
-    cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
-    user_conf = cursor.fetchone()
-    delay_time = user_conf[0] if user_conf else 10
-    rest_time = user_conf[1] if user_conf and user_conf[1] is not None else 5
-
-    running_states[user_id] = True
-    await update.effective_message.reply_text(
-        f"🚀 بدء الانضمام من المجلد **{folder_name}** ({len(links)} رابط)..."
-    )
-
-    asyncio.create_task(
-        background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
-    )
-
-async def start_joining(update, context, user_id, folder_id, folder_name):
-    links = get_folder_links(folder_id)
-    if not links:
-        await update.message.reply_text("⚠️ لا توجد روابط معلقة في هذا المجلد.")
-        return
-
-    if user_id != ADMIN_ID:
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        bal = cursor.fetchone()[0]
-        if bal < len(links):
-            await update.message.reply_text(
-                f"❌ رصيدك لا يكفي. تحتاج {len(links)} نقطة، لديك {bal} نقطة.\nتواصل مع @Ra11_8h للشحن."
-            )
-            return
-
-    cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
-    active_acc = cursor.fetchone()
-    if not active_acc:
-        await update.message.reply_text("❌ لا يوجد حساب نشط.")
-        return
-
-    cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
-    user_conf = cursor.fetchone()
-    delay_time = user_conf[0] if user_conf else 10
-    rest_time = user_conf[1] if user_conf and user_conf[1] is not None else 5
-
-    running_states[user_id] = True
-    await update.message.reply_text(
-        f"🚀 بدء الانضمام من المجلد **{folder_name}** ({len(links)} رابط)..."
-    )
-
-    asyncio.create_task(
-        background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
-    )
 
 # ========== تشغيل البوت ==========
 if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_publish_content))  # لمعالجة الوسائط في النشر
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع نظام المجلدات والإعدادات القابلة للتغيير...")
+    print("🚀 البوت يعمل مع نظام النشر في المجموعات...")
     app.run_polling()
