@@ -119,32 +119,29 @@ async def get_account_chats(session_str):
     try:
         await client.connect()
         dialogs = await client.get_dialogs()
-        chats = []
+        groups = []
+        channels = []
         for d in dialogs:
-            # تصفية ليشمل فقط القنوات والمجموعات العامة والخاصة التي هو عضو فيها
             if d.is_channel or d.is_group:
-                # نتأكد أنه عضو وليس محظوراً
                 try:
-                    # محاولة جلب المشاركين للتأكد من العضوية
+                    entity = d.entity
+                    username = getattr(entity, 'username', None)
+                    chat_info = {
+                        'id': d.id,
+                        'title': d.name,
+                        'username': username,
+                        'type': 'channel' if d.is_channel else 'group'
+                    }
                     if d.is_channel:
-                        # محاولة جلب معلومات القناة
-                        entity = d.entity
-                        if hasattr(entity, 'username'):
-                            username = entity.username
-                        else:
-                            username = None
-                        chats.append({
-                            'id': d.id,
-                            'title': d.name,
-                            'username': username,
-                            'type': 'channel' if d.is_channel else 'group'
-                        })
+                        channels.append(chat_info)
+                    else:
+                        groups.append(chat_info)
                 except:
                     continue
-        return chats
+        return groups, channels
     except Exception as e:
         logging.error(f"Error fetching chats: {e}")
-        return []
+        return [], []
     finally:
         await client.disconnect()
 
@@ -303,7 +300,6 @@ async def background_publish_task(user_id, context, task_id, account_session, ac
         await client.connect()
         me = await client.get_me()
 
-        # تحديث حالة المهمة إلى قيد التشغيل
         cursor.execute("UPDATE publish_tasks SET status='running' WHERE id=?", (task_id,))
         db.commit()
 
@@ -311,7 +307,6 @@ async def background_publish_task(user_id, context, task_id, account_session, ac
         failed = 0
 
         for chat_id in targets:
-            # التحقق من أن المهمة لم تتوقف
             if not publish_running.get(user_id, False):
                 cursor.execute("UPDATE publish_tasks SET status='stopped' WHERE id=?", (task_id,))
                 db.commit()
@@ -336,10 +331,8 @@ async def background_publish_task(user_id, context, task_id, account_session, ac
                 logging.error(f"Publish failed to {chat_id}: {e}")
                 failed += 1
 
-            # تأخير بين الرسائل
             await asyncio.sleep(delay_between)
 
-        # تحديث حالة المهمة إلى منتهية
         cursor.execute("UPDATE publish_tasks SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE id=?", (task_id,))
         db.commit()
         await context.bot.send_message(
@@ -405,22 +398,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== معالجة النشر ==========
 async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # التحقق من وجود أرقام مسجلة
     cursor.execute("SELECT id, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
     active_accounts = cursor.fetchall()
     if not active_accounts:
         await update.message.reply_text("❌ ليس لديك أي حساب نشط. قم بتسجيل الدخول أولاً.")
         return
 
-    # إذا كان هناك حساب نشط واحد فقط، نستخدمه مباشرة
     if len(active_accounts) == 1:
         acc_id, phone = active_accounts[0]
         context.user_data['publish_account_id'] = acc_id
         context.user_data['publish_phone'] = phone
-        # جلب المجموعات
         await show_account_chats(update, context, acc_id, phone)
     else:
-        # عرض الأرقام لاختيار أي منها سيتم النشر
         reply = "📱 اختر الحساب الذي ستستخدمه للنشر:\n"
         buttons = []
         for acc_id, phone in active_accounts:
@@ -430,62 +419,58 @@ async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_account_chats(update, context, acc_id, phone):
     user_id = update.effective_user.id
-    # جلب جلسة الحساب
     cursor.execute("SELECT session FROM accounts WHERE id=?", (acc_id,))
     row = cursor.fetchone()
     if not row:
         await update.message.reply_text("❌ خطأ في الحساب.")
         return
     session_str = row[0]
-    # جلب المجموعات
-    chats = await get_account_chats(session_str)
-    if not chats:
+    groups, channels = await get_account_chats(session_str)
+    if not groups and not channels:
         await update.message.reply_text("⚠️ لم يتم العثور على أي مجموعات أو قنوات هذا الحساب عضو فيها.")
         return
 
-    # عرض قائمة المجموعات مع أزرار اختيار
-    context.user_data['publish_chats'] = chats
     context.user_data['publish_account_id'] = acc_id
     context.user_data['publish_phone'] = phone
+    context.user_data['publish_groups'] = groups
+    context.user_data['publish_channels'] = channels
 
-    reply = f"📢 الحساب: {phone}\nاختر المجموعات التي تريد النشر فيها (يمكنك اختيار عدة):\n"
-    # نرسل قائمة المجموعات على دفعات لأن عددها كبير
-    for chat in chats[:50]:  # حد أقصى 50 لتجنب التكدس
-        chat_id = chat['id']
-        title = chat['title'][:30]
-        username = f"@{chat['username']}" if chat['username'] else f"ID: {chat_id}"
-        await update.message.reply_text(
-            f"{title}\n{username}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ اختيار", callback_data=f"pub_select_{chat_id}")]
-            ])
-        )
-    # زر إنهاء الاختيار
-    await update.message.reply_text(
-        "بعد اختيار المجموعات المطلوبة، اضغط على 'بدء النشر'",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 بدء النشر", callback_data="pub_start")],
-            [InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]
-        ])
-    )
-    context.user_data['publish_selected'] = []
+    reply = f"📢 الحساب: {phone}\nاختر نوع الوجهات التي تريد النشر فيها:\n"
+    keyboard = []
+    if groups:
+        keyboard.append([InlineKeyboardButton(f"📂 المجموعات ({len(groups)})", callback_data="pub_type_groups")])
+    if channels:
+        keyboard.append([InlineKeyboardButton(f"📂 القنوات ({len(channels)})", callback_data="pub_type_channels")])
+    keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+    await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ========== دالة بدء النشر ==========
-async def start_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_publish(update, context, target_type):
     user_id = update.effective_user.id
-    selected = context.user_data.get('publish_selected', [])
-    if not selected:
-        await update.message.reply_text("⚠️ لم تختر أي مجموعة للنشر.")
+    if target_type == 'groups':
+        targets = context.user_data.get('publish_groups', [])
+        type_name = "المجموعات"
+    else:
+        targets = context.user_data.get('publish_channels', [])
+        type_name = "القنوات"
+
+    if not targets:
+        await update.effective_message.reply_text(f"⚠️ لا توجد {type_name} متاحة.")
         return
+
+    # حفظ الأهداف كقائمة من المعرفات
+    target_ids = [str(chat['id']) for chat in targets]
+    context.user_data['publish_selected'] = target_ids
+    context.user_data['publish_target_type'] = type_name
 
     acc_id = context.user_data.get('publish_account_id')
     if not acc_id:
-        await update.message.reply_text("❌ خطأ: لم يتم تحديد حساب.")
+        await update.effective_message.reply_text("❌ خطأ: لم يتم تحديد حساب.")
         return
 
-    # طلب النص أو الوسائط
-    await update.message.reply_text(
-        "📝 أرسل الآن النص الذي تريد نشره (يمكنك إرسال نص، صورة، فيديو، أو ملف).\n"
+    await update.effective_message.reply_text(
+        f"📝 تم اختيار {len(target_ids)} {type_name}.\n"
+        "أرسل الآن النص الذي تريد نشره (يمكنك إرسال نص، صورة، فيديو، أو ملف).\n"
         "إذا أرسلت وسائط، يمكنك إضافة تعليق (كابتشن) معها.\n"
         "لإلغاء العملية أرسل /cancel"
     )
@@ -499,7 +484,6 @@ async def handle_publish_content(update: Update, context: ContextTypes.DEFAULT_T
     if action != 'publish_content':
         return
 
-    # حفظ المحتوى
     message = update.message
     media_type = 'text'
     media_file_id = None
@@ -521,14 +505,12 @@ async def handle_publish_content(update: Update, context: ContextTypes.DEFAULT_T
         media_type = 'text'
         message_text = message.text
 
-    # حفظ المحتوى في context
     context.user_data['publish_media_type'] = media_type
     context.user_data['publish_media_file_id'] = media_file_id
     context.user_data['publish_caption'] = caption
     if media_type == 'text':
         context.user_data['publish_message_text'] = message.text
 
-    # طلب تأكيد وضبط التأخير
     await update.message.reply_text(
         "⏱️ أرسل عدد الثواني بين كل رسالة (مثال: 30 ثانية، يُفضل 60 أو أكثر لتجنب الحظر):"
     )
@@ -547,15 +529,12 @@ async def handle_publish_delay(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("⚠️ التأخير يجب أن يكون 3 ثوانٍ على الأقل.")
             return
         context.user_data['publish_delay'] = delay
-
-        # الآن نبدأ النشر
         await start_publish_execution(update, context)
     except ValueError:
         await update.message.reply_text("❌ يرجى إرسال رقم صحيح (ثواني).")
 
 async def start_publish_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # جلب جميع البيانات
     acc_id = context.user_data.get('publish_acc_id')
     selected = context.user_data.get('publish_selected', [])
     media_type = context.user_data.get('publish_media_type', 'text')
@@ -563,8 +542,8 @@ async def start_publish_execution(update: Update, context: ContextTypes.DEFAULT_
     caption = context.user_data.get('publish_caption')
     message_text = context.user_data.get('publish_message_text', '')
     delay = context.user_data.get('publish_delay', 30)
+    target_type = context.user_data.get('publish_target_type', '')
 
-    # جلب جلسة الحساب
     cursor.execute("SELECT session, phone FROM accounts WHERE id=?", (acc_id,))
     row = cursor.fetchone()
     if not row:
@@ -572,8 +551,7 @@ async def start_publish_execution(update: Update, context: ContextTypes.DEFAULT_
         return
     session_str, phone = row
 
-    # إنشاء مهمة في قاعدة البيانات
-    targets_str = ','.join(map(str, selected))
+    targets_str = ','.join(selected)
     cursor.execute("""
         INSERT INTO publish_tasks (user_id, account_id, message_text, media_type, media_file_id, caption, targets, delay_between)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -581,10 +559,9 @@ async def start_publish_execution(update: Update, context: ContextTypes.DEFAULT_
     db.commit()
     task_id = cursor.lastrowid
 
-    # بدء المهمة في الخلفية
     publish_running[user_id] = True
     await update.message.reply_text(
-        f"🚀 بدء النشر إلى {len(selected)} مجموعة\n"
+        f"🚀 بدء النشر إلى {len(selected)} {target_type}\n"
         f"• التأخير: {delay} ثانية\n"
         f"• الحساب: {phone}\n"
         f"سيتم إرسال تقرير عند الانتهاء."
@@ -632,7 +609,6 @@ async def publish_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'stopped': '🛑',
             'failed': '❌'
         }.get(status, '❓')
-        # اختصار النص
         msg_short = msg[:50] + "..." if len(msg) > 50 else msg
         reply += f"{status_emoji} م {tid} - {status}\n"
         reply += f"   إلى {len(targets.split(','))} مجموعة\n"
@@ -671,70 +647,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         phone, session_str = row
         await query.edit_message_text(f"✅ تم اختيار الحساب: {phone}\nجاري جلب المجموعات...")
-        # جلب المجموعات
-        chats = await get_account_chats(session_str)
-        if not chats:
-            await query.edit_message_text("⚠️ لم يتم العثور على مجموعات.")
+        groups, channels = await get_account_chats(session_str)
+        if not groups and not channels:
+            await query.edit_message_text("⚠️ لم يتم العثور على مجموعات أو قنوات.")
             return
-        context.user_data['publish_chats'] = chats
         context.user_data['publish_account_id'] = acc_id
         context.user_data['publish_phone'] = phone
-        context.user_data['publish_selected'] = []
+        context.user_data['publish_groups'] = groups
+        context.user_data['publish_channels'] = channels
 
-        # عرض قائمة المجموعات
-        await query.message.reply_text(
-            f"📢 الحساب: {phone}\nاختر المجموعات التي تريد النشر فيها:"
-        )
-        # إرسال كل مجموعة كزر
-        for chat in chats[:50]:
-            chat_id = chat['id']
-            title = chat['title'][:30]
-            username = f"@{chat['username']}" if chat['username'] else f"ID:{chat_id}"
-            await query.message.reply_text(
-                f"{title}\n{username}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ اختيار", callback_data=f"pub_select_{chat_id}")]
-                ])
-            )
-        await query.message.reply_text(
-            "بعد الاختيار، اضغط 'بدء النشر'",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚀 بدء النشر", callback_data="pub_start")],
-                [InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]
-            ])
-        )
+        reply = f"📢 الحساب: {phone}\nاختر نوع الوجهات التي تريد النشر فيها:\n"
+        keyboard = []
+        if groups:
+            keyboard.append([InlineKeyboardButton(f"📂 المجموعات ({len(groups)})", callback_data="pub_type_groups")])
+        if channels:
+            keyboard.append([InlineKeyboardButton(f"📂 القنوات ({len(channels)})", callback_data="pub_type_channels")])
+        keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+        await query.edit_message_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # اختيار مجموعة
-    if data.startswith("pub_select_"):
-        chat_id = int(data.split("_")[2])
-        selected = context.user_data.get('publish_selected', [])
-        if chat_id not in selected:
-            selected.append(chat_id)
-            context.user_data['publish_selected'] = selected
-            await query.edit_message_text(f"✅ تم اختيار المجموعة (ID: {chat_id})")
-        else:
-            await query.edit_message_text("⚠️ هذه المجموعة مضافة بالفعل.")
-        return
-
-    # بدء النشر
-    if data == "pub_start":
-        selected = context.user_data.get('publish_selected', [])
-        if not selected:
-            await query.edit_message_text("⚠️ لم تختر أي مجموعة.")
-            return
-        acc_id = context.user_data.get('publish_account_id')
-        if not acc_id:
-            await query.edit_message_text("❌ خطأ: لم يتم تحديد حساب.")
-            return
-        # طلب المحتوى
-        await query.edit_message_text(
-            "📝 أرسل الآن النص أو الوسائط التي تريد نشرها.\n"
-            "يمكنك إرسال صورة، فيديو، ملف، أو نص.\n"
-            "لإلغاء العملية أرسل /cancel"
-        )
-        context.user_data['action'] = 'publish_content'
-        context.user_data['publish_acc_id'] = acc_id
+    # اختيار نوع الوجهات (مجموعات أو قنوات)
+    if data == "pub_type_groups" or data == "pub_type_channels":
+        target_type = "groups" if data == "pub_type_groups" else "channels"
+        await query.edit_message_text(f"✅ تم اختيار {target_type}.")
+        await start_publish(update, context, target_type)
         return
 
     # ------ باقي الكولباكات القديمة (المجلدات) ------
@@ -1157,7 +1093,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== معالجة النشر (المحتوى والتأخير) ==========
     if action == 'publish_content':
-        # سنتعامل معها في دوال منفصلة ولكن نمسكها هنا أيضاً لتغطية الرسائل النصية
         if update.message.text and update.message.text != "/cancel":
             context.user_data['publish_message_text'] = update.message.text
             context.user_data['publish_media_type'] = 'text'
@@ -1325,7 +1260,7 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_publish_content))  # لمعالجة الوسائط في النشر
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_publish_content))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع نظام النشر في المجموعات...")
+    print("🚀 البوت يعمل مع نظام النشر المبسط (مجموعات وقنوات)...")
     app.run_polling()
