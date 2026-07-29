@@ -217,10 +217,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
         [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
         [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
-        [KeyboardButton("🎯 شحن نقاطك")]  # الزر موجود لجميع المستخدمين
+        [KeyboardButton("🎯 شحن نقاطك")]
     ]
     
-    # أزرار لوحة تحكم المطور والمالك (بما فيها الأزرار الجديدة)
+    # أزرار لوحة تحكم المطور والمالك
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("🔋 شحن نقاط لمعلم")])
         keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
@@ -249,8 +249,18 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
     db.commit()
     
+    # ✅ معالجة زر /start أولاً
     if text == "/start":
         return await start(update, context)
+
+    # ✅ معالجة زر شحن النقاط في بداية الدالة لضمان عمله دون أي تعارض
+    if text == "🎯 شحن نقاطك":
+        await update.message.reply_text(
+            f"لشحن نقاطك يرجى التواصل على اليوزر التالي @Ra11_8h\n\n"
+            f"معرف حسابك: `{user_id}`",
+            parse_mode="Markdown"
+        )
+        return
 
     # 📥 إنهاء إرسال الروابط وحفظها
     if text == "📥 حفظ الروابط وإنهاء الإرسال" and action == 'add_links':
@@ -265,15 +275,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         context.user_data.clear()
         return await start(update, context)
-
-    # 🎯 عرض معلومات شحن النقاط لجميع المستخدمين (تم التعديل حسب الطلب)
-    if text == "🎯 شحن نقاطك":
-        await update.message.reply_text(
-            f"لشحن نقاطك يرجى التواصل على اليوزر التالي @Ra11_8h\n\n"
-            f"معرف حسابك: `{user_id}`",
-            parse_mode="Markdown"
-        )
-        return
 
     # 🔋 ميزة شحن النقاط للمستخدمين (خاصة بالمالك فقط)
     if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
@@ -494,8 +495,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg_chunk = f"📂 **روابط المستخدم (`{target_uid}`) المسجلة ({len(user_links)} رابط):**\n\n"
                 for idx, (lnk, stat) in enumerate(user_links, 1):
                     status_icon = "✅" if stat == 'completed' else ("❌" if stat == 'failed' else "⏳")
-                    line = f"{idx}. {status_icon} https://t.me/{lnk if not lnk.startswith('joinchat') and not lnk.startswith('+') else ''}\n"
-                    # للتأكد من إرسال رابط قابل للضغط والنقر بشكل صحيح:
                     formatted_link = lnk if ("http://" in lnk or "https://" in lnk) else f"https://t.me/{lnk}"
                     line = f"{idx}. {status_icon} {formatted_link}\n"
                     
