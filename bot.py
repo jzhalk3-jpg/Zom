@@ -307,9 +307,47 @@ async def fetch_user_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ هذه الخاصية للمشرف فقط.")
+        # للمستخدم العادي: يعرض روابطه الخاصة
+        cursor.execute("""
+            SELECT link, status, folder_id 
+            FROM links 
+            WHERE user_id=?
+            ORDER BY folder_id, id
+        """, (user_id,))
+        user_links = cursor.fetchall()
+        if not user_links:
+            await update.message.reply_text("📂 ليس لديك أي روابط مسجلة.")
+            return
+        
+        folders = {}
+        for link, status, folder_id in user_links:
+            if folder_id not in folders:
+                cursor.execute("SELECT folder_name FROM folders WHERE id=?", (folder_id,))
+                folder_name = cursor.fetchone()
+                folders[folder_id] = {
+                    'name': folder_name[0] if folder_name else f"مجلد {folder_id}",
+                    'links': []
+                }
+            folders[folder_id]['links'].append((link, status))
+        
+        msg = f"📂 **روابطك المسجلة**\n\n"
+        for folder_id, folder_data in folders.items():
+            msg += f"📁 **{folder_data['name']}**\n"
+            for link, status in folder_data['links']:
+                status_icon = "✅" if status == 'completed' else ("❌" if status == 'failed' else "⏳")
+                formatted_link = link if ("http://" in link or "https://" in link) else f"https://t.me/{link}"
+                msg += f"{status_icon} {formatted_link}\n"
+            msg += "\n"
+        
+        if len(msg) > 4000:
+            parts = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
+            for part in parts:
+                await update.message.reply_text(part, parse_mode="Markdown", disable_web_page_preview=False)
+        else:
+            await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=False)
         return
 
+    # للمشرف: يعرض إحصائيات المستخدمين
     cursor.execute("""
         SELECT users.user_id, COUNT(links.id) 
         FROM users 
@@ -377,7 +415,6 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
         
         # تقسيم الرسالة إذا كانت طويلة
         if len(msg) > 4000:
-            # تقسيم إلى أجزاء
             parts = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
             for part in parts:
                 await update.message.reply_text(part, parse_mode="Markdown", disable_web_page_preview=False)
@@ -699,6 +736,12 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fetch_user_links(update, context)
         return
 
+    # ========== زر سحب روابط المستخدمين (للمشرف فقط) ==========
+    if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
+        # إعادة استخدام نفس الدالة لكن مع وضع المشرف
+        await fetch_user_links(update, context)
+        return
+
     # ========== زر تسجيل الدخول ==========
     if text == "📱 تسجيل الدخول الجديد":
         await update.message.reply_text("أرسل رقم الهاتف مع رمز الدولة (مثال: +966500000000):")
@@ -726,4 +769,241 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("SELECT phone FROM accounts WHERE user_id=?", (user_id,))
         accounts = cursor.fetchall()
         if not accounts:
-            await update.message
+            await update.message.reply_text("❌ لا توجد أرقام.")
+            return
+        reply = "🗑️ اختر رقم للحذف:\n\n"
+        for (phone,) in accounts:
+            reply += f"• {phone}\n"
+        reply += "\nأرسل الرقم كاملاً."
+        context.user_data['action'] = 'delete_account'
+        await update.message.reply_text(reply)
+        return
+
+    # ========== زر تحديد الوقت ==========
+    if text == "⏱️ تحديد الوقت":
+        cursor.execute("SELECT delay FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        current = row[0] if row else 10
+        await update.message.reply_text(f"⏱️ الوقت الحالي: {current} ثانية.\nأرسل الوقت الجديد (ثواني):")
+        context.user_data['action'] = 'set_delay'
+        return
+
+    # ========== زر استراحة كل 5 روابط ==========
+    if text == "💤 استراحة كل 5 روابط":
+        cursor.execute("SELECT rest_time FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        current = row[0] if row else 5
+        await update.message.reply_text(f"💤 وقت الاستراحة الحالي: {current} دقائق.\nأرسل الوقت الجديد (دقائق):")
+        context.user_data['action'] = 'set_rest_time'
+        return
+
+    # ========== أزرار المطور ==========
+    if text == "👑 لوحة المطور" and user_id == ADMIN_ID:
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM accounts")
+        total_accounts = cursor.fetchone()[0]
+        cursor.execute("""
+            SELECT users.user_id, users.balance, COUNT(accounts.id) 
+            FROM users 
+            LEFT JOIN accounts ON users.user_id = accounts.user_id 
+            GROUP BY users.user_id
+        """)
+        details = cursor.fetchall()
+        admin_reply = f"👑 **لوحة المطور**\n👥 المستخدمين: {total_users}\n📱 الأرقام: {total_accounts}\n\n"
+        for u_id, bal, count in details:
+            admin_reply += f"• المستخدم `{u_id}`: نقاط {bal} | أرقام {count}\n"
+        await update.message.reply_text(admin_reply, parse_mode="Markdown")
+        return
+
+    if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل معرف المستخدم:")
+        context.user_data['action'] = 'admin_charge_id'
+        return
+
+    if text == "📢 إذاعة رسالة عامة" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل الرسالة للإذاعة (أو /cancel):")
+        context.user_data['action'] = 'admin_broadcast'
+        return
+
+    if text == "🗑️ حذف أرشيف الروابط" and user_id == ADMIN_ID:
+        cursor.execute("DELETE FROM links")
+        cursor.execute("DELETE FROM folders")
+        db.commit()
+        await update.message.reply_text("🗑️ تم حذف جميع المجلدات والروابط.")
+        return
+
+    # ========== معالجة الإدخالات الأخرى ==========
+    if action == 'add_links':
+        found = extract_links(text)
+        if found:
+            if 'temp_links_list' not in context.user_data:
+                context.user_data['temp_links_list'] = []
+            context.user_data['temp_links_list'].extend(found)
+        return
+
+    if action == 'set_delay':
+        try:
+            new_delay = int(text)
+            if new_delay < 1:
+                raise ValueError
+            cursor.execute("UPDATE users SET delay=? WHERE user_id=?", (new_delay, user_id))
+            db.commit()
+            await update.message.reply_text(f"✅ تم تحديث الوقت إلى: {new_delay} ثانية.")
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إرسال رقم صحيح (أكبر من 0).")
+        context.user_data.clear()
+        return
+
+    if action == 'set_rest_time':
+        try:
+            new_rest = int(text)
+            if new_rest < 0:
+                raise ValueError
+            cursor.execute("UPDATE users SET rest_time=? WHERE user_id=?", (new_rest, user_id))
+            db.commit()
+            await update.message.reply_text(f"✅ تم تحديث وقت الاستراحة إلى: {new_rest} دقائق.")
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إرسال رقم صحيح (0 أو أكثر).")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة تسجيل الدخول ==========
+    if action == 'login_phone':
+        context.user_data['temp_phone'] = text
+        await update.message.reply_text("⏳ جاري إرسال كود التحقق...\nأرسل الكود فور وصوله:")
+        try:
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            send_code = await client.send_code_request(text)
+            context.user_data['phone_code_hash'] = send_code.phone_code_hash
+            context.user_data['client_obj'] = client
+            context.user_data['action'] = 'login_otp'
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ: {str(e)}")
+            context.user_data.clear()
+        return
+
+    if action == 'login_otp':
+        phone = context.user_data.get('temp_phone')
+        phone_code_hash = context.user_data.get('phone_code_hash')
+        client = context.user_data.get('client_obj')
+        try:
+            await client.sign_in(phone, text, phone_code_hash=phone_code_hash)
+            session_str = client.session.save()
+            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
+            cursor.execute("INSERT INTO accounts (user_id, session, phone, is_active) VALUES (?, ?, ?, 1)", (user_id, session_str, phone))
+            db.commit()
+            await update.message.reply_text(f"🎉 تم إضافة الرقم {phone} وتفعيله.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ في الكود: {str(e)}")
+        finally:
+            if client:
+                await client.disconnect()
+            context.user_data.clear()
+        return
+
+    # ========== معالجة تبديل الحساب ==========
+    if action == 'switch_account':
+        cursor.execute("SELECT id FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+        acc = cursor.fetchone()
+        if acc:
+            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
+            cursor.execute("UPDATE accounts SET is_active=1 WHERE user_id=? AND phone=?", (user_id, text))
+            db.commit()
+            await update.message.reply_text(f"✅ تم تفعيل الرقم: {text}")
+        else:
+            await update.message.reply_text("❌ هذا الرقم غير موجود في قائمتك.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة حذف حساب ==========
+    if action == 'delete_account':
+        cursor.execute("SELECT id, is_active FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+        acc = cursor.fetchone()
+        if acc:
+            cursor.execute("DELETE FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+            if acc[1] == 1:
+                cursor.execute("SELECT id FROM accounts WHERE user_id=? LIMIT 1", (user_id,))
+                other = cursor.fetchone()
+                if other:
+                    cursor.execute("UPDATE accounts SET is_active=1 WHERE id=?", (other[0],))
+            db.commit()
+            await update.message.reply_text(f"🗑️ تم حذف الرقم {text} نهائياً.")
+        else:
+            await update.message.reply_text("❌ لم يتم العثور على هذا الرقم.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة أوامر المطور الخاصة ==========
+    if action == 'admin_fetch_user_links' and user_id == ADMIN_ID:
+        try:
+            target_uid = int(text)
+            await handle_fetch_user_links(update, context, target_uid)
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إدخال معرف رقمي صحيح.")
+        context.user_data.clear()
+        return
+
+    if action == 'admin_broadcast' and user_id == ADMIN_ID:
+        if text == "/cancel":
+            context.user_data.clear()
+            await update.message.reply_text("❌ تم إلغاء الإذاعة.")
+            return
+        cursor.execute("SELECT user_id FROM users")
+        all_users = cursor.fetchall()
+        success = 0
+        fail = 0
+        await update.message.reply_text(f"🚀 جاري الإرسال إلى {len(all_users)} مستخدم...")
+        for (u_id,) in all_users:
+            try:
+                await context.bot.send_message(chat_id=u_id, text=text)
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                fail += 1
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ تم الإرسال: {success} نجاح، {fail} فشل.")
+        return
+
+    if action == 'admin_charge_id' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            context.user_data['target_charge_id'] = target
+            await update.message.reply_text(f"🔋 المستهدف: `{target}`\nأرسل عدد النقاط:")
+            context.user_data['action'] = 'admin_charge_amount'
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+            context.user_data.clear()
+        return
+
+    if action == 'admin_charge_amount' and user_id == ADMIN_ID:
+        try:
+            amount = int(text)
+            target = context.user_data.get('target_charge_id')
+            cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (target,))
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target))
+            db.commit()
+            cursor.execute("SELECT balance FROM users WHERE user_id=?", (target,))
+            new_bal = cursor.fetchone()[0]
+            await update.message.reply_text(f"✅ تم إضافة {amount} نقطة للمستخدم `{target}`\nرصيده الآن: {new_bal}")
+            try:
+                await context.bot.send_message(chat_id=target, text=f"🎉 تم شحن {amount} نقطة، رصيدك الآن: {new_bal}")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ أرسل عدد صحيح.")
+        context.user_data.clear()
+        return
+
+    # إذا لم يتطابق أي شيء
+    await update.message.reply_text("⚠️ زر غير معروف أو حدث خطأ، يرجى استخدام الأزرار المتاحة.")
+
+# ========== تشغيل البوت ==========
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    print("🚀 البوت يعمل بكامل ميزاته...")
+    app.run_polling()
