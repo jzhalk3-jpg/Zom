@@ -63,19 +63,8 @@ CREATE TABLE IF NOT EXISTS links (
 """)
 db.commit()
 
-# ترقية الجداول القديمة
 try:
     cursor.execute("ALTER TABLE users ADD COLUMN subscription_expiry TEXT")
-    db.commit()
-except sqlite3.OperationalError:
-    pass
-try:
-    cursor.execute("ALTER TABLE users DROP COLUMN daily_usage")
-    db.commit()
-except sqlite3.OperationalError:
-    pass
-try:
-    cursor.execute("ALTER TABLE users DROP COLUMN last_usage_date")
     db.commit()
 except sqlite3.OperationalError:
     pass
@@ -108,7 +97,7 @@ def delete_folder_and_links(folder_id):
     cursor.execute("DELETE FROM folders WHERE id=?", (folder_id,))
     db.commit()
 
-# ========== دوال الاشتراك (بدون حد يومي) ==========
+# ========== دوال الاشتراك ==========
 def get_subscription_expiry(user_id):
     cursor.execute("SELECT subscription_expiry FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
@@ -144,56 +133,27 @@ def remove_subscription(user_id):
     cursor.execute("UPDATE users SET subscription_expiry=NULL WHERE user_id=?", (user_id,))
     db.commit()
 
-# ========== دالة التحقق من الاشتراك في القناة الإجبارية ==========
+# ========== دالة التحقق من الاشتراك في القناة الإجبارية (باستخدام البوت) ==========
 async def check_channel_subscription(user_id, context):
-    """تتحقق من أن المستخدم مشترك في القناة الإجبارية باستخدام حسابه النشط"""
-    # استثناء المشرف
+    """تتحقق من أن المستخدم مشترك في القناة الإجبارية باستخدام البوت نفسه"""
     if user_id == ADMIN_ID:
         return True, "✅ المشرف معفي من الاشتراك الإجباري"
     
-    # جلب الجلسة النشطة للمستخدم
-    cursor.execute("SELECT session FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
-    row = cursor.fetchone()
-    if not row:
-        return False, "❌ يجب عليك تسجيل الدخول أولاً (استخدم زر تسجيل الدخول الجديد)."
-    
-    session_str = row[0]
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
-        await client.connect()
-        # محاولة الحصول على كيان القناة
-        try:
-            channel_entity = await client.get_entity(f"@{REQUIRED_CHANNEL}")
-        except ValueError:
-            return False, f"❌ لم يتم العثور على قناة الاشتراك الإجباري. تأكد من أن البوت مشرف في القناة @{REQUIRED_CHANNEL}"
-        
-        # التحقق من عضوية المستخدم في القناة
-        try:
-            participants = await client.get_participants(channel_entity, search=user_id)
-            if participants:
-                return True, "✅ أنت مشترك في القناة الإجبارية"
-            else:
-                return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
-        except errors.FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
-            try:
-                participants = await client.get_participants(channel_entity, search=user_id)
-                if participants:
-                    return True, "✅ أنت مشترك في القناة الإجبارية"
-                else:
-                    return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
-            except Exception as e2:
-                return False, f"❌ حدث خطأ أثناء التحقق من الاشتراك: {str(e2)}"
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "user not participant" in error_msg or "not found" in error_msg:
-                return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
-            else:
-                return False, f"❌ حدث خطأ أثناء التحقق من الاشتراك: {str(e)}"
+        # استخدام البوت للتحقق من العضوية
+        chat_member = await context.bot.get_chat_member(chat_id=f"@{REQUIRED_CHANNEL}", user_id=user_id)
+        if chat_member.status in ["member", "administrator", "creator"]:
+            return True, "✅ أنت مشترك في القناة الإجبارية"
+        else:
+            return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
     except Exception as e:
-        return False, f"❌ خطأ في الاتصال: {str(e)}"
-    finally:
-        await client.disconnect()
+        error_msg = str(e).lower()
+        if "user not found" in error_msg or "chat not found" in error_msg:
+            return False, f"❌ لم يتم العثور على القناة. تأكد من أن البوت مشرف في القناة @{REQUIRED_CHANNEL}"
+        elif "not enough rights" in error_msg or "bot" in error_msg:
+            return False, f"❌ البوت ليس لديه صلاحية كافية. يجب أن يكون البوت مشرفاً (Admin) في القناة @{REQUIRED_CHANNEL}"
+        else:
+            return False, f"❌ حدث خطأ أثناء التحقق: {str(e)}"
 
 # ========== دالة إرسال رسالة الترحيب ==========
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, name):
@@ -221,7 +181,6 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         [KeyboardButton("📁 مجلدات الروابط")]
     ]
 
-    # أزرار المشرف
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
         keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("➕ إضافة اشتراك")])
@@ -393,7 +352,7 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
     finally:
         running_states[user_id] = False
 
-# ========== معالجة سحب روابط المستخدمين (للمشرف فقط) ==========
+# ========== معالجة سحب روابط المستخدمين ==========
 async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -421,7 +380,6 @@ async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(reply, parse_mode="Markdown")
     context.user_data['action'] = 'admin_fetch_user_links'
 
-# ========== معالجة سحب روابط المستخدم (بعد إرسال المعرف) ==========
 async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_TYPE, target_uid):
     try:
         cursor.execute("""
@@ -469,7 +427,7 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
 
-# ========== معالجة الكولباك ==========
+# ========== معالجة الأزرار التفاعلية ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -482,16 +440,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== التحقق من الاشتراك عبر الزر ==========
+    # ========== التحقق من الاشتراك ==========
     if data == "check_subscription":
         is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
         if is_subscribed:
-            # إرسال رسالة نجاح، ثم الترحيب
             await query.edit_message_text("✅ تم التحقق بنجاح! أنت مشترك في القناة.")
-            # حذف الرسالة القديمة وإرسال الترحيب
+            # إرسال الترحيب في نفس الرسالة أو جديدة
             await send_welcome(update, context, user_id, name)
         else:
-            # إرسال رسالة فشل مع الزر مرة أخرى
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
                 [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
@@ -502,6 +458,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # ========== بقية الكولباك ==========
     if data.startswith("join_folder_"):
         folder_id = int(data.split("_")[2])
         cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
@@ -577,7 +534,7 @@ async def start_joining_from_callback(update, context, user_id, folder_id, folde
         background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
     )
 
-# ========== دالة البداية المباشرة ==========
+# ========== بداية الانضمام المباشر ==========
 async def start_joining(update, context, user_id, folder_id, folder_name):
     links = get_folder_links(folder_id)
     if not links:
@@ -609,7 +566,7 @@ async def start_joining(update, context, user_id, folder_id, folder_name):
         background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
     )
 
-# ========== دالة معالجة الرسائل الرئيسية ==========
+# ========== معالج الرسائل الرئيسي ==========
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_PAUSED
     user_id = update.effective_user.id
@@ -642,7 +599,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # إذا كان مشتركاً أو مشرفاً، نرسل الترحيب
+        # إذا مشترك أو مشرف
         await send_welcome(update, context, user_id, name)
         return
 
@@ -671,9 +628,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fetch_user_links_admin(update, context)
         return
 
-    # ========== باقي الأزرار العامة (تتطلب اشتراك) ==========
-    # التحقق من الاشتراك الإجباري (للمستخدمين العاديين)
-    if user_id != ADMIN_ID and text not in ["📱 تسجيل الدخول الجديد", "➕ إضافة قناة"]:
+    # ========== التحقق من الاشتراك الإجباري لجميع الأوامر (للمستخدمين العاديين) ==========
+    if user_id != ADMIN_ID:
         is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
         if not is_subscribed:
             keyboard = InlineKeyboardMarkup([
@@ -686,6 +642,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+    # ========== باقي الأزرار العامة ==========
     if text == "📁 مجلدات الروابط":
         folders = get_user_folders(user_id)
         if not folders:
@@ -940,7 +897,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== معالجة إضافة اشتراك ==========
+    # ========== إضافة اشتراك (للمشرف) ==========
     if action == 'admin_add_subscription_id' and user_id == ADMIN_ID:
         try:
             target_uid = int(text)
@@ -966,7 +923,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_subscription(target, days)
             await update.message.reply_text(f"✅ تم إضافة اشتراك لمدة {days} يوم للمستخدم `{target}`")
             try:
-                await context.bot.send_message(chat_id=target, text=f"🎉 تم تفعيل اشتراكك لمدة {days} يوم. يمكنك الآن الانضمام إلى الروابط.")
+                await context.bot.send_message(chat_id=target, text=f"🎉 تم تفعيل اشتراكك لمدة {days} يوم.")
             except:
                 pass
         except ValueError:
@@ -974,7 +931,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== معالجة حذف اشتراك ==========
+    # ========== حذف اشتراك (للمشرف) ==========
     if action == 'admin_remove_subscription' and user_id == ADMIN_ID:
         try:
             target_uid = int(text)
@@ -987,7 +944,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remove_subscription(target_uid)
             await update.message.reply_text(f"✅ تم حذف اشتراك المستخدم `{target_uid}`")
             try:
-                await context.bot.send_message(chat_id=target_uid, text="⚠️ لقد قمت بعمل خطأ، تم حذف اشتراكك. يرجى التواصل مع المشرف.")
+                await context.bot.send_message(chat_id=target_uid, text="⚠️ تم حذف اشتراكك.")
             except:
                 pass
         except ValueError:
@@ -995,7 +952,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== معالجة سحب روابط المستخدم (للمشرف) ==========
+    # ========== سحب روابط المستخدم (للمشرف) ==========
     if action == 'admin_fetch_user_links' and user_id == ADMIN_ID:
         try:
             target_uid = int(text)
@@ -1005,7 +962,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== معالجة الإذاعة ==========
+    # ========== إذاعة (للمشرف) ==========
     if action == 'admin_broadcast' and user_id == ADMIN_ID:
         if text == "/cancel":
             context.user_data.clear()
@@ -1027,7 +984,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ تم الإرسال: {success} نجاح، {fail} فشل.")
         return
 
-    # ========== معالجة تسجيل الدخول ==========
+    # ========== تسجيل الدخول ==========
     if action == 'login_phone':
         context.user_data['temp_phone'] = text
         await update.message.reply_text("⏳ جاري إرسال كود التحقق...\nأرسل الكود فور وصوله:")
@@ -1100,5 +1057,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", handle_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل بنظام الاشتراك الإجباري (التحقق أولاً)...")
+    print("🚀 البوت يعمل مع الاشتراك الإجباري (باستخدام البوت للتحقق)...")
     app.run_polling()
