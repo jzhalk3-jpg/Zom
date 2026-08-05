@@ -347,9 +347,13 @@ async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     await update.message.reply_text(
-        "📥 أرسل رابط القناة التي تريد استخراج الروابط منها.\n"
-        "مثال: https://t.me/username  أو @username\n\n"
-        "⚠️ **ملاحظة هامة:** يجب أن يكون البوت (@bot_username) **أدمن** في القناة حتى يتمكن من جلب جميع الروابط."
+        "📥 **أرسل رابط القناة** التي تريد استخراج الروابط منها.\n\n"
+        "📌 أمثلة على الروابط المقبولة:\n"
+        "• `https://t.me/username` (قناة عامة)\n"
+        "• `@username` (معرف القناة)\n"
+        "• `https://t.me/+abc123` (رابط دعوة خاص)\n"
+        "• `https://t.me/joinchat/abc123` (رابط دعوة قديم)\n\n"
+        "⚠️ **ملاحظة هامة:** يجب أن يكون البوت (`@userbot`) **مشرفاً (Admin)** في القناة حتى يتمكن من جلب جميع الروابط."
     )
     context.user_data['action'] = 'admin_add_channel'
 
@@ -360,19 +364,43 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     text = update.message.text.strip()
-    # استخراج معرف القناة
-    channel_id = None
+    
+    # استخراج معرف القناة من أنواع مختلفة من الروابط
+    channel_identifier = None
+    is_private_invite = False
+    invite_hash = None
+
+    # محاولة استخراج المعرف من الرابط
     if text.startswith('@'):
-        channel_id = text[1:]
+        channel_identifier = text[1:]
+    elif 't.me/joinchat/' in text:
+        # رابط دعوة قديم
+        invite_hash = text.split('t.me/joinchat/')[-1].split('/')[0].split('?')[0]
+        is_private_invite = True
+    elif 't.me/+' in text:
+        # رابط دعوة خاص
+        invite_hash = text.split('t.me/+')[-1].split('/')[0].split('?')[0]
+        is_private_invite = True
     elif 't.me/' in text:
         parts = text.split('t.me/')
         if len(parts) > 1:
-            channel_id = parts[1].split('/')[0].split('?')[0]
+            identifier = parts[1].split('/')[0].split('?')[0]
+            if identifier.startswith('+'):
+                invite_hash = identifier[1:]
+                is_private_invite = True
+            else:
+                channel_identifier = identifier
     elif text.isdigit():
-        channel_id = int(text)
+        channel_identifier = int(text)
 
-    if not channel_id:
-        await update.message.reply_text("❌ لم أستطع التعرف على رابط القناة. أرسل الرابط بصيغة @username أو t.me/username")
+    if not channel_identifier and not is_private_invite:
+        await update.message.reply_text(
+            "❌ لم أستطع التعرف على رابط القناة.\n"
+            "تأكد من إرسال الرابط بصيغة:\n"
+            "• `https://t.me/username`\n"
+            "• `@username`\n"
+            "• `https://t.me/+abc123` (للقنوات الخاصة)"
+        )
         return
 
     cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
@@ -382,17 +410,42 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     session_str, phone = acc
-    await update.message.reply_text(f"🔄 جاري الاتصال بالقناة {channel_id} ...")
+    await update.message.reply_text(f"🔄 جاري الاتصال بالقناة...")
 
     try:
         client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         await client.connect()
 
-        # الحصول على كيان القناة
+        # محاولة الحصول على الكيان
+        entity = None
         try:
-            entity = await client.get_entity(channel_id)
+            if is_private_invite and invite_hash:
+                # محاولة الانضمام إلى القناة الخاصة عبر رابط الدعوة
+                try:
+                    updates = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
+                    if updates.chats:
+                        entity = updates.chats[0]
+                        await update.message.reply_text(f"✅ تم الانضمام إلى القناة الخاصة بنجاح.")
+                    else:
+                        # ربما هو عضو بالفعل، نحاول جلب الكيان
+                        entity = await client.get_entity(text)
+                except Exception as e:
+                    # قد يكون عضو بالفعل، نحاول جلب الكيان مباشرة
+                    try:
+                        entity = await client.get_entity(text)
+                    except:
+                        await update.message.reply_text(f"❌ لا يمكن الوصول إلى القناة الخاصة: {str(e)[:100]}\nتأكد من أن البوت مشرف في القناة.")
+                        await client.disconnect()
+                        return
+            else:
+                entity = await client.get_entity(channel_identifier)
         except Exception as e:
-            await update.message.reply_text(f"❌ لا يمكن العثور على القناة: {str(e)}")
+            await update.message.reply_text(f"❌ لا يمكن العثور على القناة: {str(e)[:100]}")
+            await client.disconnect()
+            return
+
+        if not entity:
+            await update.message.reply_text("❌ لم يتم العثور على القناة.")
             await client.disconnect()
             return
 
@@ -402,9 +455,8 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not bot_username:
             bot_username = f"@{bot_me.first_name or 'bot'}"
 
-        # محاولة جلب معلومات المشاركين للتحقق من صلاحية البوت
+        # محاولة جلب قائمة المشرفين للتحقق
         try:
-            # محاولة جلب قائمة المشرفين للتحقق
             admins = await client.get_participants(entity, filter=types.ChannelParticipantsAdmins())
             bot_is_admin = False
             for admin in admins:
@@ -437,7 +489,7 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         all_links = []
         offset_id = 0
-        limit = 100  # جلب 100 رسالة في كل مرة لتجنب الضغط
+        limit = 100
         total_messages = 0
         links_found = 0
 
@@ -452,7 +504,6 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
                     if total_messages % 100 == 0:
                         await update.message.reply_text(f"🔄 تم جلب {total_messages} رسالة حتى الآن...")
 
-                    # استخراج الروابط من النص
                     if msg.text:
                         found = extract_links(msg.text)
                         if found:
@@ -464,14 +515,11 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
                             all_links.extend(found)
                             links_found += len(found)
                     
-                    # تحديث offset_id لأقدم رسالة
                     offset_id = msg.id
                 
-                # إذا كان عدد الرسائل أقل من limit، نكون وصلنا للنهاية
                 if len(messages) < limit:
                     break
                 
-                # تأخير بسيط لتجنب الـ rate limit
                 await asyncio.sleep(0.5)
                 
             except Exception as e:
@@ -503,7 +551,6 @@ async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             added += 1
         db.commit()
 
-        # إرسال تقرير مفصل
         await update.message.reply_text(
             f"✅ **تم استخراج وإضافة الروابط بنجاح!**\n\n"
             f"📊 **إحصائيات:**\n"
@@ -1181,5 +1228,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع ميزة إضافة القناة وجلب جميع الروابط (يشترط أن يكون البوت أدمن)...")
+    print("🚀 البوت يعمل مع ميزة إضافة القناة (يدعم الروابط الخاصة ويشترط أن يكون البوت أدمن)...")
     app.run_polling()
