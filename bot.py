@@ -3,7 +3,7 @@ import asyncio
 import re
 import logging
 from datetime import datetime, timedelta
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient, functions, errors
 from telethon.sessions import StringSession
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -14,6 +14,9 @@ API_ID = 39289901
 API_HASH = "a5dcef068387dd95705046f910d6cd48"
 
 ADMIN_ID = 5064913080
+
+# قناة الاشتراك الإجباري
+REQUIRED_CHANNEL = "ATLe1240"  # بدون @
 
 BOT_PAUSED = False
 
@@ -66,6 +69,16 @@ try:
     db.commit()
 except sqlite3.OperationalError:
     pass
+try:
+    cursor.execute("ALTER TABLE users DROP COLUMN daily_usage")
+    db.commit()
+except sqlite3.OperationalError:
+    pass
+try:
+    cursor.execute("ALTER TABLE users DROP COLUMN last_usage_date")
+    db.commit()
+except sqlite3.OperationalError:
+    pass
 
 running_states = {}
 
@@ -95,7 +108,7 @@ def delete_folder_and_links(folder_id):
     cursor.execute("DELETE FROM folders WHERE id=?", (folder_id,))
     db.commit()
 
-# ========== دوال الاشتراك ==========
+# ========== دوال الاشتراك (بدون حد يومي) ==========
 def get_subscription_expiry(user_id):
     cursor.execute("SELECT subscription_expiry FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
@@ -130,6 +143,62 @@ def add_subscription(user_id, days):
 def remove_subscription(user_id):
     cursor.execute("UPDATE users SET subscription_expiry=NULL WHERE user_id=?", (user_id,))
     db.commit()
+
+# ========== دالة التحقق من الاشتراك في القناة الإجبارية ==========
+async def check_channel_subscription(user_id, context):
+    """تتحقق من أن المستخدم مشترك في القناة الإجبارية باستخدام حسابه النشط"""
+    # استثناء المشرف
+    if user_id == ADMIN_ID:
+        return True, "✅ المشرف معفي من الاشتراك الإجباري"
+    
+    # جلب الجلسة النشطة للمستخدم
+    cursor.execute("SELECT session FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        return False, "❌ يجب عليك تسجيل الدخول أولاً (استخدم زر تسجيل الدخول الجديد)."
+    
+    session_str = row[0]
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await client.connect()
+        # محاولة الحصول على كيان القناة
+        try:
+            channel_entity = await client.get_entity(f"@{REQUIRED_CHANNEL}")
+        except ValueError:
+            # إذا لم يتم العثور على القناة، قد يكون المعرف خطأ
+            return False, f"❌ لم يتم العثور على قناة الاشتراك الإجباري. تأكد من أن البوت مشرف في القناة @{REQUIRED_CHANNEL}"
+        
+        # التحقق من عضوية المستخدم في القناة
+        try:
+            # الحصول على المشاركين، نبحث عن المستخدم
+            participants = await client.get_participants(channel_entity, search=user_id)
+            if participants:
+                return True, "✅ أنت مشترك في القناة الإجبارية"
+            else:
+                return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
+        except errors.FloodWaitError as e:
+            # إذا كان هناك طلب مكثف، ننتظر
+            await asyncio.sleep(e.seconds)
+            # نعيد المحاولة مرة واحدة
+            try:
+                participants = await client.get_participants(channel_entity, search=user_id)
+                if participants:
+                    return True, "✅ أنت مشترك في القناة الإجبارية"
+                else:
+                    return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
+            except Exception as e2:
+                return False, f"❌ حدث خطأ أثناء التحقق من الاشتراك: {str(e2)}"
+        except Exception as e:
+            # قد يكون البوت ليس لديه صلاحية الوصول للمشاركين، أو المستخدم ليس عضواً
+            error_msg = str(e).lower()
+            if "user not participant" in error_msg or "not found" in error_msg:
+                return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
+            else:
+                return False, f"❌ حدث خطأ أثناء التحقق من الاشتراك: {str(e)}"
+    except Exception as e:
+        return False, f"❌ خطأ في الاتصال: {str(e)}"
+    finally:
+        await client.disconnect()
 
 # ========== منطق الانضمام ==========
 async def join_logic(session_str, link):
@@ -319,7 +388,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([KeyboardButton("➖ حذف اشتراك")])
         keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
         keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
-        keyboard.append([KeyboardButton("➕ إضافة قناة")])
 
     paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
 
@@ -332,237 +400,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="Markdown"
     )
-
-# ========== معالجة إضافة قناة ==========
-async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ هذه الخاصية للمشرف فقط.")
-        return
-
-    cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
-    acc = cursor.fetchone()
-    if not acc:
-        await update.message.reply_text("❌ يجب عليك تسجيل الدخول بحساب تيليجرام أولاً (استخدم زر تسجيل الدخول الجديد).")
-        return
-
-    await update.message.reply_text(
-        "📥 **أرسل رابط القناة** التي تريد استخراج الروابط منها.\n\n"
-        "📌 أمثلة على الروابط المقبولة:\n"
-        "• `https://t.me/username` (قناة عامة)\n"
-        "• `@username` (معرف القناة)\n"
-        "• `https://t.me/+abc123` (رابط دعوة خاص)\n"
-        "• `https://t.me/joinchat/abc123` (رابط دعوة قديم)\n\n"
-        "⚠️ **ملاحظة هامة:** يجب أن يكون البوت (`@userbot`) **مشرفاً (Admin)** في القناة حتى يتمكن من جلب جميع الروابط."
-    )
-    context.user_data['action'] = 'admin_add_channel'
-
-# ========== معالجة رابط القناة (جلب جميع الروابط) ==========
-async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return
-
-    text = update.message.text.strip()
-    
-    # استخراج معرف القناة من أنواع مختلفة من الروابط
-    channel_identifier = None
-    is_private_invite = False
-    invite_hash = None
-
-    # محاولة استخراج المعرف من الرابط
-    if text.startswith('@'):
-        channel_identifier = text[1:]
-    elif 't.me/joinchat/' in text:
-        # رابط دعوة قديم
-        invite_hash = text.split('t.me/joinchat/')[-1].split('/')[0].split('?')[0]
-        is_private_invite = True
-    elif 't.me/+' in text:
-        # رابط دعوة خاص
-        invite_hash = text.split('t.me/+')[-1].split('/')[0].split('?')[0]
-        is_private_invite = True
-    elif 't.me/' in text:
-        parts = text.split('t.me/')
-        if len(parts) > 1:
-            identifier = parts[1].split('/')[0].split('?')[0]
-            if identifier.startswith('+'):
-                invite_hash = identifier[1:]
-                is_private_invite = True
-            else:
-                channel_identifier = identifier
-    elif text.isdigit():
-        channel_identifier = int(text)
-
-    if not channel_identifier and not is_private_invite:
-        await update.message.reply_text(
-            "❌ لم أستطع التعرف على رابط القناة.\n"
-            "تأكد من إرسال الرابط بصيغة:\n"
-            "• `https://t.me/username`\n"
-            "• `@username`\n"
-            "• `https://t.me/+abc123` (للقنوات الخاصة)"
-        )
-        return
-
-    cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
-    acc = cursor.fetchone()
-    if not acc:
-        await update.message.reply_text("❌ لا يوجد حساب نشط. سجل الدخول أولاً.")
-        return
-
-    session_str, phone = acc
-    await update.message.reply_text(f"🔄 جاري الاتصال بالقناة...")
-
-    try:
-        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        await client.connect()
-
-        # محاولة الحصول على الكيان
-        entity = None
-        try:
-            if is_private_invite and invite_hash:
-                # محاولة الانضمام إلى القناة الخاصة عبر رابط الدعوة
-                try:
-                    updates = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
-                    if updates.chats:
-                        entity = updates.chats[0]
-                        await update.message.reply_text(f"✅ تم الانضمام إلى القناة الخاصة بنجاح.")
-                    else:
-                        # ربما هو عضو بالفعل، نحاول جلب الكيان
-                        entity = await client.get_entity(text)
-                except Exception as e:
-                    # قد يكون عضو بالفعل، نحاول جلب الكيان مباشرة
-                    try:
-                        entity = await client.get_entity(text)
-                    except:
-                        await update.message.reply_text(f"❌ لا يمكن الوصول إلى القناة الخاصة: {str(e)[:100]}\nتأكد من أن البوت مشرف في القناة.")
-                        await client.disconnect()
-                        return
-            else:
-                entity = await client.get_entity(channel_identifier)
-        except Exception as e:
-            await update.message.reply_text(f"❌ لا يمكن العثور على القناة: {str(e)[:100]}")
-            await client.disconnect()
-            return
-
-        if not entity:
-            await update.message.reply_text("❌ لم يتم العثور على القناة.")
-            await client.disconnect()
-            return
-
-        # ========== التحقق من أن البوت أدمن في القناة ==========
-        bot_me = await client.get_me()
-        bot_username = bot_me.username
-        if not bot_username:
-            bot_username = f"@{bot_me.first_name or 'bot'}"
-
-        # محاولة جلب قائمة المشرفين للتحقق
-        try:
-            admins = await client.get_participants(entity, filter=types.ChannelParticipantsAdmins())
-            bot_is_admin = False
-            for admin in admins:
-                if admin.id == bot_me.id:
-                    bot_is_admin = True
-                    break
-            
-            if not bot_is_admin:
-                await update.message.reply_text(
-                    f"❌ **البوت ليس أدمن في القناة!**\n\n"
-                    f"يجب إضافة البوت (`@{bot_username}`) كـ **أدمن** في القناة أولاً.\n"
-                    f"لا يمكن جلب الروابط بدون صلاحية الأدمن.\n\n"
-                    f"بعد إضافة البوت كأدمن، أعد إرسال رابط القناة مرة أخرى."
-                )
-                await client.disconnect()
-                return
-        except Exception as e:
-            # إذا لم نتمكن من جلب المشرفين، قد يكون البوت ليس أدمن
-            await update.message.reply_text(
-                f"❌ **التحقق من صلاحيات البوت فشل!**\n\n"
-                f"يجب إضافة البوت (`@{bot_username}`) كـ **أدمن** في القناة.\n"
-                f"خطأ: {str(e)[:100]}\n\n"
-                f"بعد إضافة البوت كأدمن، أعد إرسال رابط القناة مرة أخرى."
-            )
-            await client.disconnect()
-            return
-
-        # ========== جلب جميع الروابط من القناة ==========
-        await update.message.reply_text("📥 جاري جلب جميع الرسائل من القناة... قد يستغرق وقتاً طويلاً إذا كانت القناة كبيرة.")
-
-        all_links = []
-        offset_id = 0
-        limit = 100
-        total_messages = 0
-        links_found = 0
-
-        while True:
-            try:
-                messages = await client.get_messages(entity, limit=limit, offset_id=offset_id)
-                if not messages:
-                    break
-                
-                for msg in messages:
-                    total_messages += 1
-                    if total_messages % 100 == 0:
-                        await update.message.reply_text(f"🔄 تم جلب {total_messages} رسالة حتى الآن...")
-
-                    if msg.text:
-                        found = extract_links(msg.text)
-                        if found:
-                            all_links.extend(found)
-                            links_found += len(found)
-                    if msg.caption:
-                        found = extract_links(msg.caption)
-                        if found:
-                            all_links.extend(found)
-                            links_found += len(found)
-                    
-                    offset_id = msg.id
-                
-                if len(messages) < limit:
-                    break
-                
-                await asyncio.sleep(0.5)
-                
-            except Exception as e:
-                await update.message.reply_text(f"⚠️ توقف الجلب مؤقتاً: {str(e)[:100]}")
-                break
-
-        await client.disconnect()
-
-        if not all_links:
-            await update.message.reply_text(
-                f"⚠️ لم يتم العثور على أي روابط في القناة.\n"
-                f"📊 عدد الرسائل التي تم فحصها: {total_messages}"
-            )
-            return
-
-        # إزالة التكرارات
-        all_links = list(dict.fromkeys(all_links))
-        total_links = len(all_links)
-
-        # إنشاء مجلد جديد للمشرف
-        folder_id = create_folder(user_id)
-        cursor.execute("SELECT folder_name FROM folders WHERE id=?", (folder_id,))
-        folder_name = cursor.fetchone()[0]
-
-        # إضافة الروابط إلى المجلد
-        added = 0
-        for link in all_links:
-            cursor.execute("INSERT INTO links (user_id, folder_id, link) VALUES (?, ?, ?)", (user_id, folder_id, link))
-            added += 1
-        db.commit()
-
-        await update.message.reply_text(
-            f"✅ **تم استخراج وإضافة الروابط بنجاح!**\n\n"
-            f"📊 **إحصائيات:**\n"
-            f"• عدد الرسائل التي تم فحصها: {total_messages}\n"
-            f"• عدد الروابط المستخرجة (قبل إزالة التكرارات): {links_found}\n"
-            f"• عدد الروابط الفريدة المضافة: {added}\n"
-            f"• 📁 تم حفظها في مجلد جديد: **{folder_name}**\n\n"
-            f"يمكنك الآن استخدام زر (بدء الانضمام) لاستخدامها."
-        )
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
 
 # ========== معالجة سحب روابط المستخدمين (للمشرف فقط) ==========
 async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -779,6 +616,22 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "/start":
         return await start(update, context)
 
+    # ========== التحقق من الاشتراك في القناة الإجبارية ==========
+    # استثناء المشرف وأوامر تسجيل الدخول والتحقق من الاشتراك
+    if user_id != ADMIN_ID and action not in ['login_phone', 'login_otp']:
+        is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+        if not is_subscribed:
+            # إرسال رسالة مع رابط القناة وزر للتحقق
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+            ])
+            await update.message.reply_text(
+                f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                reply_markup=keyboard
+            )
+            return
+
     # ========== أزرار المشرف ==========
     if text == "⏹️ إيقاف البوت" and user_id == ADMIN_ID:
         BOT_PAUSED = True
@@ -802,15 +655,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
         await fetch_user_links_admin(update, context)
-        return
-
-    if text == "➕ إضافة قناة" and user_id == ADMIN_ID:
-        await handle_add_channel(update, context)
-        return
-
-    # ========== معالجة رابط القناة (عند إرساله) ==========
-    if action == 'admin_add_channel' and user_id == ADMIN_ID:
-        await handle_channel_link(update, context)
         return
 
     # ========== باقي الأزرار العامة ==========
@@ -1228,5 +1072,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع ميزة إضافة القناة (يدعم الروابط الخاصة ويشترط أن يكون البوت أدمن)...")
+    print("🚀 البوت يعمل بنظام الاشتراك الإجباري في القناة...")
     app.run_polling()
