@@ -165,21 +165,17 @@ async def check_channel_subscription(user_id, context):
         try:
             channel_entity = await client.get_entity(f"@{REQUIRED_CHANNEL}")
         except ValueError:
-            # إذا لم يتم العثور على القناة، قد يكون المعرف خطأ
             return False, f"❌ لم يتم العثور على قناة الاشتراك الإجباري. تأكد من أن البوت مشرف في القناة @{REQUIRED_CHANNEL}"
         
         # التحقق من عضوية المستخدم في القناة
         try:
-            # الحصول على المشاركين، نبحث عن المستخدم
             participants = await client.get_participants(channel_entity, search=user_id)
             if participants:
                 return True, "✅ أنت مشترك في القناة الإجبارية"
             else:
                 return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
         except errors.FloodWaitError as e:
-            # إذا كان هناك طلب مكثف، ننتظر
             await asyncio.sleep(e.seconds)
-            # نعيد المحاولة مرة واحدة
             try:
                 participants = await client.get_participants(channel_entity, search=user_id)
                 if participants:
@@ -189,7 +185,6 @@ async def check_channel_subscription(user_id, context):
             except Exception as e2:
                 return False, f"❌ حدث خطأ أثناء التحقق من الاشتراك: {str(e2)}"
         except Exception as e:
-            # قد يكون البوت ليس لديه صلاحية الوصول للمشاركين، أو المستخدم ليس عضواً
             error_msg = str(e).lower()
             if "user not participant" in error_msg or "not found" in error_msg:
                 return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
@@ -199,6 +194,52 @@ async def check_channel_subscription(user_id, context):
         return False, f"❌ خطأ في الاتصال: {str(e)}"
     finally:
         await client.disconnect()
+
+# ========== دالة إرسال رسالة الترحيب ==========
+async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, name):
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    db.commit()
+
+    context.user_data.clear()
+
+    expiry = get_subscription_expiry(user_id)
+    expiry_display = expiry if expiry else "لا يوجد اشتراك"
+    if expiry:
+        try:
+            expiry_date = datetime.fromisoformat(expiry)
+            if expiry_date <= datetime.now():
+                expiry_display = "منتهي (جدد اشتراكك)"
+        except:
+            expiry_display = "خطأ في التاريخ"
+
+    keyboard = [
+        [KeyboardButton("📱 تسجيل الدخول الجديد"), KeyboardButton("🔗 إرسال روابط")],
+        [KeyboardButton("🚀 بدء الانضمام"), KeyboardButton("🛑 إيقاف الانضمام")],
+        [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
+        [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
+        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
+        [KeyboardButton("📁 مجلدات الروابط")]
+    ]
+
+    # أزرار المشرف
+    if user_id == ADMIN_ID:
+        keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
+        keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("➕ إضافة اشتراك")])
+        keyboard.append([KeyboardButton("➖ حذف اشتراك")])
+        keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
+        keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
+
+    paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
+
+    await update.message.reply_text(
+        f"🙋‍♂️ أهلاً بك يا {name} في بوت الانضمام التلقائي!{paused_msg}\n\n"
+        f"💳 معرفك: `{user_id}`\n"
+        f"📅 **الاشتراك:** {expiry_display}\n\n"
+        f"📋 البوت يعمل بنظام الاشتراك.\n"
+        f"اختر من الأزرار:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+        parse_mode="Markdown"
+    )
 
 # ========== منطق الانضمام ==========
 async def join_logic(session_str, link):
@@ -352,55 +393,6 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
     finally:
         running_states[user_id] = False
 
-# ========== دوال الأزرار ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    name = update.effective_user.first_name
-
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    db.commit()
-
-    context.user_data.clear()
-
-    expiry = get_subscription_expiry(user_id)
-    expiry_display = expiry if expiry else "لا يوجد اشتراك"
-    if expiry:
-        try:
-            expiry_date = datetime.fromisoformat(expiry)
-            if expiry_date <= datetime.now():
-                expiry_display = "منتهي (جدد اشتراكك)"
-        except:
-            expiry_display = "خطأ في التاريخ"
-
-    keyboard = [
-        [KeyboardButton("📱 تسجيل الدخول الجديد"), KeyboardButton("🔗 إرسال روابط")],
-        [KeyboardButton("🚀 بدء الانضمام"), KeyboardButton("🛑 إيقاف الانضمام")],
-        [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
-        [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
-        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
-        [KeyboardButton("📁 مجلدات الروابط")]
-    ]
-
-    # أزرار المشرف
-    if user_id == ADMIN_ID:
-        keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
-        keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("➕ إضافة اشتراك")])
-        keyboard.append([KeyboardButton("➖ حذف اشتراك")])
-        keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
-        keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
-
-    paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
-
-    await update.message.reply_text(
-        f"🙋‍♂️ أهلاً بك يا {name} في بوت الانضمام التلقائي!{paused_msg}\n\n"
-        f"💳 معرفك: `{user_id}`\n"
-        f"📅 **الاشتراك:** {expiry_display}\n\n"
-        f"📋 البوت يعمل بنظام الاشتراك.\n"
-        f"اختر من الأزرار:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-
 # ========== معالجة سحب روابط المستخدمين (للمشرف فقط) ==========
 async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -483,10 +475,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = update.effective_user.id
+    name = update.effective_user.first_name
 
     if data == "cancel":
         await query.edit_message_text("❌ تم الإلغاء.")
         context.user_data.clear()
+        return
+
+    # ========== التحقق من الاشتراك عبر الزر ==========
+    if data == "check_subscription":
+        is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+        if is_subscribed:
+            # إرسال رسالة نجاح، ثم الترحيب
+            await query.edit_message_text("✅ تم التحقق بنجاح! أنت مشترك في القناة.")
+            # حذف الرسالة القديمة وإرسال الترحيب
+            await send_welcome(update, context, user_id, name)
+        else:
+            # إرسال رسالة فشل مع الزر مرة أخرى
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+            ])
+            await query.edit_message_text(
+                f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                reply_markup=keyboard
+            )
         return
 
     if data.startswith("join_folder_"):
@@ -614,23 +627,24 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.commit()
 
     if text == "/start":
-        return await start(update, context)
+        name = update.effective_user.first_name
+        # التحقق من الاشتراك أولاً
+        if user_id != ADMIN_ID:
+            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+            if not is_subscribed:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+                ])
+                await update.message.reply_text(
+                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                    reply_markup=keyboard
+                )
+                return
 
-    # ========== التحقق من الاشتراك في القناة الإجبارية ==========
-    # استثناء المشرف وأوامر تسجيل الدخول والتحقق من الاشتراك
-    if user_id != ADMIN_ID and action not in ['login_phone', 'login_otp']:
-        is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-        if not is_subscribed:
-            # إرسال رسالة مع رابط القناة وزر للتحقق
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-            ])
-            await update.message.reply_text(
-                f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                reply_markup=keyboard
-            )
-            return
+        # إذا كان مشتركاً أو مشرفاً، نرسل الترحيب
+        await send_welcome(update, context, user_id, name)
+        return
 
     # ========== أزرار المشرف ==========
     if text == "⏹️ إيقاف البوت" and user_id == ADMIN_ID:
@@ -657,7 +671,21 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fetch_user_links_admin(update, context)
         return
 
-    # ========== باقي الأزرار العامة ==========
+    # ========== باقي الأزرار العامة (تتطلب اشتراك) ==========
+    # التحقق من الاشتراك الإجباري (للمستخدمين العاديين)
+    if user_id != ADMIN_ID and text not in ["📱 تسجيل الدخول الجديد", "➕ إضافة قناة"]:
+        is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+        if not is_subscribed:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+            ])
+            await update.message.reply_text(
+                f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                reply_markup=keyboard
+            )
+            return
+
     if text == "📁 مجلدات الروابط":
         folders = get_user_folders(user_id)
         if not folders:
@@ -1069,8 +1097,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== تشغيل البوت ==========
 if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", handle_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل بنظام الاشتراك الإجباري في القناة...")
+    print("🚀 البوت يعمل بنظام الاشتراك الإجباري (التحقق أولاً)...")
     app.run_polling()
