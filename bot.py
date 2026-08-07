@@ -2,8 +2,7 @@ import sqlite3
 import asyncio
 import re
 import logging
-from datetime import datetime, timedelta
-from telethon import TelegramClient, functions, errors
+from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -15,9 +14,10 @@ API_HASH = "a5dcef068387dd95705046f910d6cd48"
 
 ADMIN_ID = 5064913080
 
-# قناة الاشتراك الإجباري
-REQUIRED_CHANNEL = "ATLe1240"  # بدون @
+# قناة الاشتراك الإجباري (ضع المعرف بدون @)
+REQUIRED_CHANNEL = "ATLe1240"
 
+# متغير عام للتحكم في إيقاف البوت (للمشرف فقط)
 BOT_PAUSED = False
 
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY, 
     delay INTEGER DEFAULT 10,
     rest_time INTEGER DEFAULT 5,
-    subscription_expiry TEXT
+    balance INTEGER DEFAULT 0
 )
 """)
 cursor.execute("""
@@ -63,13 +63,14 @@ CREATE TABLE IF NOT EXISTS links (
 """)
 db.commit()
 
+# ترقية الجداول القديمة
 try:
-    cursor.execute("ALTER TABLE users ADD COLUMN subscription_expiry TEXT")
+    cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
     db.commit()
 except sqlite3.OperationalError:
     pass
 
-running_states = {}
+running_states = {}  # لحفظ حالة الانضمام
 
 def extract_links(text):
     pattern = r"(?:https?://)?(?:t\.me/|telegram\.me/)([a-zA-Z0-9_]+|joinchat/[a-zA-Z0-9_-]+|\+[a-zA-Z0-9_-]+)"
@@ -97,50 +98,12 @@ def delete_folder_and_links(folder_id):
     cursor.execute("DELETE FROM folders WHERE id=?", (folder_id,))
     db.commit()
 
-# ========== دوال الاشتراك ==========
-def get_subscription_expiry(user_id):
-    cursor.execute("SELECT subscription_expiry FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-    if not row:
-        return None
-    return row[0]
-
-def is_subscription_active(user_id):
-    if user_id == ADMIN_ID:
-        return True
-    expiry = get_subscription_expiry(user_id)
-    if not expiry:
-        return False
-    try:
-        expiry_date = datetime.fromisoformat(expiry)
-        return expiry_date > datetime.now()
-    except:
-        return False
-
-def can_join(user_id):
-    if user_id == ADMIN_ID:
-        return True, "✅ المشرف لا يخضع للاشتراك"
-    if not is_subscription_active(user_id):
-        return False, "❌ ليس لديك اشتراك نشط. تواصل مع المشرف للاشتراك."
-    return True, "✅ يمكنك الانضمام (اشتراك نشط)"
-
-def add_subscription(user_id, days):
-    expiry = (datetime.now() + timedelta(days=days)).isoformat()
-    cursor.execute("UPDATE users SET subscription_expiry=? WHERE user_id=?", (expiry, user_id))
-    db.commit()
-
-def remove_subscription(user_id):
-    cursor.execute("UPDATE users SET subscription_expiry=NULL WHERE user_id=?", (user_id,))
-    db.commit()
-
 # ========== دالة التحقق من الاشتراك في القناة الإجبارية (باستخدام البوت) ==========
 async def check_channel_subscription(user_id, context):
-    """تتحقق من أن المستخدم مشترك في القناة الإجبارية باستخدام البوت نفسه"""
+    """تتحقق من أن المستخدم مشترك في القناة الإجبارية باستخدام البوت نفسه."""
     if user_id == ADMIN_ID:
         return True, "✅ المشرف معفي من الاشتراك الإجباري"
-    
     try:
-        # استخدام البوت للتحقق من العضوية
         chat_member = await context.bot.get_chat_member(chat_id=f"@{REQUIRED_CHANNEL}", user_id=user_id)
         if chat_member.status in ["member", "administrator", "creator"]:
             return True, "✅ أنت مشترك في القناة الإجبارية"
@@ -154,51 +117,6 @@ async def check_channel_subscription(user_id, context):
             return False, f"❌ البوت ليس لديه صلاحية كافية. يجب أن يكون البوت مشرفاً (Admin) في القناة @{REQUIRED_CHANNEL}"
         else:
             return False, f"❌ حدث خطأ أثناء التحقق: {str(e)}"
-
-# ========== دالة إرسال رسالة الترحيب ==========
-async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, name):
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    db.commit()
-
-    context.user_data.clear()
-
-    expiry = get_subscription_expiry(user_id)
-    expiry_display = expiry if expiry else "لا يوجد اشتراك"
-    if expiry:
-        try:
-            expiry_date = datetime.fromisoformat(expiry)
-            if expiry_date <= datetime.now():
-                expiry_display = "منتهي (جدد اشتراكك)"
-        except:
-            expiry_display = "خطأ في التاريخ"
-
-    keyboard = [
-        [KeyboardButton("📱 تسجيل الدخول الجديد"), KeyboardButton("🔗 إرسال روابط")],
-        [KeyboardButton("🚀 بدء الانضمام"), KeyboardButton("🛑 إيقاف الانضمام")],
-        [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
-        [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
-        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
-        [KeyboardButton("📁 مجلدات الروابط")]
-    ]
-
-    if user_id == ADMIN_ID:
-        keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
-        keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("➕ إضافة اشتراك")])
-        keyboard.append([KeyboardButton("➖ حذف اشتراك")])
-        keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
-        keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
-
-    paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
-
-    await update.message.reply_text(
-        f"🙋‍♂️ أهلاً بك يا {name} في بوت الانضمام التلقائي!{paused_msg}\n\n"
-        f"💳 معرفك: `{user_id}`\n"
-        f"📅 **الاشتراك:** {expiry_display}\n\n"
-        f"📋 البوت يعمل بنظام الاشتراك.\n"
-        f"اختر من الأزرار:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
 
 # ========== منطق الانضمام ==========
 async def join_logic(session_str, link):
@@ -258,13 +176,14 @@ async def join_logic(session_str, link):
     finally:
         await client.disconnect()
 
-# ========== دالة الخلفية للانضمام ==========
+# ========== دالة الخلفية للانضمام (معدلة) ==========
 async def background_join_task(user_id, context, active_acc, delay_time, rest_time_minutes, folder_id, folder_name):
     try:
         join_counter = 0
         local_db = sqlite3.connect("bot_final.db")
         local_cursor = local_db.cursor()
 
+        # جلب جميع الروابط المعلقة في المجلد مع معرفاتها
         local_cursor.execute("SELECT id, link FROM links WHERE folder_id=? AND status='pending'", (folder_id,))
         all_links = local_cursor.fetchall()
         total_links = len(all_links)
@@ -277,10 +196,12 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
             if not running_states.get(user_id):
                 break
 
-            can, msg = can_join(user_id)
-            if not can:
-                await context.bot.send_message(chat_id=user_id, text=f"⛔ توقف الانضمام: {msg}")
-                break
+            if user_id != ADMIN_ID:
+                local_cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+                current_bal = local_cursor.fetchone()[0]
+                if current_bal < 1:
+                    await context.bot.send_message(chat_id=user_id, text="⚠️ نفدت نقاطك، يرجى شحنها.")
+                    break
 
             if join_counter > 0 and join_counter % 5 == 0:
                 await context.bot.send_message(
@@ -315,23 +236,31 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                     await context.bot.send_message(chat_id=user_id, text="🔄 إعادة محاولة الانضمام...")
                     continue
 
+                # تحديث حالة الرابط
                 local_cursor.execute("UPDATE links SET status=? WHERE id=?", ('completed' if status == "SUCCESS" else 'failed', lid))
+                if user_id != ADMIN_ID:
+                    local_cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (user_id,))
                 local_db.commit()
 
                 join_counter += 1
+                
+                # حساب الروابط المتبقية
                 remaining_links = total_links - index
-                expiry = get_subscription_expiry(user_id)
-                expiry_display = expiry if expiry else "غير مفعل"
 
+                local_cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+                rem_bal = local_cursor.fetchone()[0]
+                bal_str = "المشرف (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{rem_bal} نقطة"
+
+                # إرسال رسالة محسنة تحتوي على معلومات المجلد والرابط
                 await context.bot.send_message(
                     chat_id=user_id,
                     text=f"📁 **المجلد:** {folder_name}\n"
                          f"🔗 **الرابط رقم:** {index} من {total_links}\n"
-                         f"📊 **المتبقي في المجلد:** {remaining_links} رابط\n"
+                         f"📊 **المتبقي:** {remaining_links} رابط\n"
                          f"📱 **الرقم:** {active_acc[1]}\n"
                          f"🔗 **الرابط:** {link}\n"
                          f"📌 **النتيجة:** {msg}\n"
-                         f"📅 **اشتراك ينتهي:** {expiry_display}",
+                         f"🎯 **نقاطك:** {bal_str}",
                     parse_mode="Markdown"
                 )
                 break
@@ -352,13 +281,95 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
     finally:
         running_states[user_id] = False
 
-# ========== معالجة سحب روابط المستخدمين ==========
-async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ========== دوال الأزرار ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    name = update.effective_user.first_name
+
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
+    db.commit()
+
+    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    balance = cursor.fetchone()[0]
+
+    context.user_data.clear()
+
+    keyboard = [
+        [KeyboardButton("📱 تسجيل الدخول الجديد"), KeyboardButton("🔗 إرسال روابط")],
+        [KeyboardButton("🚀 بدء الانضمام"), KeyboardButton("🛑 إيقاف الانضمام")],
+        [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
+        [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
+        [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
+        [KeyboardButton("🎯 شحن نقاطك"), KeyboardButton("📁 مجلدات الروابط")]
+    ]
+
+    # أزرار المشرف
+    if user_id == ADMIN_ID:
+        keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
+        keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("🔋 شحن نقاط لمعلم")])
+        keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
+        keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
+
+    balance_display = "المشرف العام (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{balance} نقطة"
+
+    paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
+
+    await update.message.reply_text(
+        f"🙋‍♂️ أهلاً بك يا {name} في بوت الانضمام التلقائي!{paused_msg}\n\n"
+        f"💳 معرفك: `{user_id}`\n"
+        f"🎯 رصيدك: {balance_display}\n\n"
+        f"📋 تكلفة الرابط = 1 نقطة.\n"
+        f"اختر من الأزرار:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+        parse_mode="Markdown"
+    )
+
+# ========== معالجة سحب روابط المستخدم (للمشرف) ==========
+async def fetch_user_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
     if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ هذه الخاصية للمشرف فقط.")
+        # للمستخدم العادي: يعرض روابطه الخاصة
+        cursor.execute("""
+            SELECT link, status, folder_id 
+            FROM links 
+            WHERE user_id=?
+            ORDER BY folder_id, id
+        """, (user_id,))
+        user_links = cursor.fetchall()
+        if not user_links:
+            await update.message.reply_text("📂 ليس لديك أي روابط مسجلة.")
+            return
+        
+        folders = {}
+        for link, status, folder_id in user_links:
+            if folder_id not in folders:
+                cursor.execute("SELECT folder_name FROM folders WHERE id=?", (folder_id,))
+                folder_name = cursor.fetchone()
+                folders[folder_id] = {
+                    'name': folder_name[0] if folder_name else f"مجلد {folder_id}",
+                    'links': []
+                }
+            folders[folder_id]['links'].append((link, status))
+        
+        msg = f"📂 **روابطك المسجلة**\n\n"
+        for folder_id, folder_data in folders.items():
+            msg += f"📁 **{folder_data['name']}**\n"
+            for link, status in folder_data['links']:
+                status_icon = "✅" if status == 'completed' else ("❌" if status == 'failed' else "⏳")
+                formatted_link = link if ("http://" in link or "https://" in link) else f"https://t.me/{link}"
+                msg += f"{status_icon} {formatted_link}\n"
+            msg += "\n"
+        
+        if len(msg) > 4000:
+            parts = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
+            for part in parts:
+                await update.message.reply_text(part, parse_mode="Markdown", disable_web_page_preview=False)
+        else:
+            await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=False)
         return
 
+    # للمشرف: يعرض إحصائيات المستخدمين
     cursor.execute("""
         SELECT users.user_id, COUNT(links.id) 
         FROM users 
@@ -375,13 +386,15 @@ async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_T
     for uid, count in data:
         reply += f"• المستخدم: `{uid}` → عدد الروابط: ({count})\n"
     
-    reply += "\n👇 أرسل معرف المستخدم (User ID) الذي تريد سحب روابطه."
+    reply += "\n👇 **للمشرف فقط:** أرسل معرف المستخدم (User ID) الذي تريد سحب روابطه."
     
     await update.message.reply_text(reply, parse_mode="Markdown")
     context.user_data['action'] = 'admin_fetch_user_links'
 
+# ========== معالجة سحب روابط المستخدم (بعد إرسال المعرف) ==========
 async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_TYPE, target_uid):
     try:
+        # جلب جميع روابط المستخدم بجميع حالاتها
         cursor.execute("""
             SELECT link, status, folder_id 
             FROM links 
@@ -394,6 +407,7 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text(f"⚠️ لا توجد أي روابط مسجلة للمستخدم `{target_uid}`", parse_mode="Markdown")
             return
         
+        # تجميع الروابط حسب المجلد
         folders = {}
         for link, status, folder_id in user_links:
             if folder_id not in folders:
@@ -406,17 +420,22 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
             folders[folder_id]['links'].append((link, status))
         
         total_links = len(user_links)
+        
+        # إرسال الروابط مع أزرار قابلة للضغط
         msg = f"📂 **روابط المستخدم `{target_uid}`**\n"
         msg += f"📊 **إجمالي الروابط:** {total_links}\n\n"
         
+        # إرسال كل مجلد على حدة
         for folder_id, folder_data in folders.items():
             msg += f"📁 **{folder_data['name']}**\n"
             for link, status in folder_data['links']:
                 status_icon = "✅" if status == 'completed' else ("❌" if status == 'failed' else "⏳")
+                # جعل الرابط قابل للضغط والنقر
                 formatted_link = link if ("http://" in link or "https://" in link) else f"https://t.me/{link}"
                 msg += f"{status_icon} {formatted_link}\n"
             msg += "\n"
         
+        # تقسيم الرسالة إذا كانت طويلة
         if len(msg) > 4000:
             parts = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
             for part in parts:
@@ -427,13 +446,12 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
 
-# ========== معالجة الأزرار التفاعلية ==========
+# ========== معالجة الكولباك ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = update.effective_user.id
-    name = update.effective_user.first_name
 
     if data == "cancel":
         await query.edit_message_text("❌ تم الإلغاء.")
@@ -445,8 +463,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
         if is_subscribed:
             await query.edit_message_text("✅ تم التحقق بنجاح! أنت مشترك في القناة.")
-            # إرسال الترحيب في نفس الرسالة أو جديدة
-            await send_welcome(update, context, user_id, name)
+            # إعادة إرسال الترحيب (يمكن استخدام دالة start مباشرة)
+            await start(update, context)
         else:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
@@ -458,7 +476,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ========== بقية الكولباك ==========
+    # ------ اختيار مجلد للانضمام ------
     if data.startswith("join_folder_"):
         folder_id = int(data.split("_")[2])
         cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
@@ -472,6 +490,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_joining_from_callback(update, context, user_id, folder_id, folder_name)
         return
 
+    # ------ عرض روابط المجلد ------
     if data.startswith("select_folder_"):
         folder_id = int(data.split("_")[2])
         cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
@@ -491,6 +510,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(reply, parse_mode="Markdown", disable_web_page_preview=False)
         return
 
+    # ------ حذف مجلد ------
     if data.startswith("delete_folder_"):
         folder_id = int(data.split("_")[2])
         cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
@@ -509,10 +529,14 @@ async def start_joining_from_callback(update, context, user_id, folder_id, folde
         await update.effective_message.reply_text("⚠️ لا توجد روابط معلقة في هذا المجلد.")
         return
 
-    can, msg = can_join(user_id)
-    if not can:
-        await update.effective_message.reply_text(f"⛔ لا يمكن بدء الانضمام: {msg}")
-        return
+    if user_id != ADMIN_ID:
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        bal = cursor.fetchone()[0]
+        if bal < len(links):
+            await update.effective_message.reply_text(
+                f"❌ رصيدك لا يكفي. تحتاج {len(links)} نقطة، لديك {bal} نقطة.\nتواصل مع @Ra11_8h للشحن."
+            )
+            return
 
     cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
     active_acc = cursor.fetchone()
@@ -534,17 +558,21 @@ async def start_joining_from_callback(update, context, user_id, folder_id, folde
         background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
     )
 
-# ========== بداية الانضمام المباشر ==========
+# ========== دالة البداية المباشرة (للمجلد الواحد) ==========
 async def start_joining(update, context, user_id, folder_id, folder_name):
     links = get_folder_links(folder_id)
     if not links:
         await update.message.reply_text("⚠️ لا توجد روابط معلقة في هذا المجلد.")
         return
 
-    can, msg = can_join(user_id)
-    if not can:
-        await update.message.reply_text(f"⛔ لا يمكن بدء الانضمام: {msg}")
-        return
+    if user_id != ADMIN_ID:
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        bal = cursor.fetchone()[0]
+        if bal < len(links):
+            await update.message.reply_text(
+                f"❌ رصيدك لا يكفي. تحتاج {len(links)} نقطة، لديك {bal} نقطة.\nتواصل مع @Ra11_8h للشحن."
+            )
+            return
 
     cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
     active_acc = cursor.fetchone()
@@ -566,7 +594,7 @@ async def start_joining(update, context, user_id, folder_id, folder_name):
         background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
     )
 
-# ========== معالج الرسائل الرئيسي ==========
+# ========== دالة معالجة الرسائل الرئيسية ==========
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_PAUSED
     user_id = update.effective_user.id
@@ -576,16 +604,52 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     action = context.user_data.get('action')
 
+    # ---- التحقق من حالة إيقاف البوت ----
     if BOT_PAUSED and user_id != ADMIN_ID:
         await update.message.reply_text("⛔ البوت متوقف حالياً، يرجى التواصل مع المشرف.")
         return
 
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
     db.commit()
 
     if text == "/start":
-        name = update.effective_user.first_name
-        # التحقق من الاشتراك أولاً
+        # التحقق من الاشتراك الإجباري قبل عرض الترحيب
+        if user_id != ADMIN_ID:
+            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+            if not is_subscribed:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+                ])
+                await update.message.reply_text(
+                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                    reply_markup=keyboard
+                )
+                return
+        return await start(update, context)
+
+    # ========== أزرار المشرف لإيقاف/تشغيل البوت ==========
+    if text == "⏹️ إيقاف البوت" and user_id == ADMIN_ID:
+        BOT_PAUSED = True
+        await update.message.reply_text("✅ تم إيقاف البوت. لن يستجيب لأي أوامر من المستخدمين العاديين.")
+        return
+
+    if text == "▶️ تشغيل البوت" and user_id == ADMIN_ID:
+        BOT_PAUSED = False
+        await update.message.reply_text("✅ تم تشغيل البوت. جميع المستخدمين يمكنهم استخدام البوت الآن.")
+        return
+
+    # ========== زر شحن النقاط ==========
+    if text == "🎯 شحن نقاطك":
+        await update.message.reply_text(
+            f"لشحن نقاطك يرجى التواصل على @Ra11_8h\n\nمعرفك: `{user_id}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ========== زر مجلدات الروابط ==========
+    if text == "📁 مجلدات الروابط":
+        # التحقق من الاشتراك
         if user_id != ADMIN_ID:
             is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
             if not is_subscribed:
@@ -599,51 +663,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # إذا مشترك أو مشرف
-        await send_welcome(update, context, user_id, name)
-        return
-
-    # ========== أزرار المشرف ==========
-    if text == "⏹️ إيقاف البوت" and user_id == ADMIN_ID:
-        BOT_PAUSED = True
-        await update.message.reply_text("✅ تم إيقاف البوت.")
-        return
-
-    if text == "▶️ تشغيل البوت" and user_id == ADMIN_ID:
-        BOT_PAUSED = False
-        await update.message.reply_text("✅ تم تشغيل البوت.")
-        return
-
-    if text == "➕ إضافة اشتراك" and user_id == ADMIN_ID:
-        await update.message.reply_text("أرسل معرف المستخدم (User ID) الذي تريد إضافة اشتراك له:")
-        context.user_data['action'] = 'admin_add_subscription_id'
-        return
-
-    if text == "➖ حذف اشتراك" and user_id == ADMIN_ID:
-        await update.message.reply_text("أرسل معرف المستخدم (User ID) الذي تريد حذف اشتراكه:")
-        context.user_data['action'] = 'admin_remove_subscription'
-        return
-
-    if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
-        await fetch_user_links_admin(update, context)
-        return
-
-    # ========== التحقق من الاشتراك الإجباري لجميع الأوامر (للمستخدمين العاديين) ==========
-    if user_id != ADMIN_ID:
-        is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-        if not is_subscribed:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-            ])
-            await update.message.reply_text(
-                f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                reply_markup=keyboard
-            )
-            return
-
-    # ========== باقي الأزرار العامة ==========
-    if text == "📁 مجلدات الروابط":
         folders = get_user_folders(user_id)
         if not folders:
             await update.message.reply_text("📁 لا توجد مجلدات حالياً. أرسل روابط واحفظها لإنشاء مجلد جديد.")
@@ -659,6 +678,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
+    # ========== زر حفظ الروابط وإنهاء الإرسال ==========
     if text == "📥 حفظ الروابط وإنهاء الإرسال" and action == 'add_links':
         temp_links = context.user_data.get('temp_links_list', [])
         if not temp_links:
@@ -676,7 +696,22 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return await start(update, context)
 
+    # ========== زر إرسال روابط ==========
     if text == "🔗 إرسال روابط":
+        # التحقق من الاشتراك
+        if user_id != ADMIN_ID:
+            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+            if not is_subscribed:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+                ])
+                await update.message.reply_text(
+                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                    reply_markup=keyboard
+                )
+                return
+
         await update.message.reply_text(
             "📥 أرسل الروابط تباعاً، ثم اضغط على زر (📥 حفظ الروابط وإنهاء الإرسال).",
             reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📥 حفظ الروابط وإنهاء الإرسال")]], resize_keyboard=True)
@@ -685,10 +720,25 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_links_list'] = []
         return
 
+    # ========== زر بدء الانضمام ==========
     if text == "🚀 بدء الانضمام":
         if running_states.get(user_id) == True:
             await update.message.reply_text("⚠️ هناك عملية جارية بالفعل.")
             return
+
+        # التحقق من الاشتراك
+        if user_id != ADMIN_ID:
+            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+            if not is_subscribed:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+                ])
+                await update.message.reply_text(
+                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                    reply_markup=keyboard
+                )
+                return
 
         folders = get_user_folders(user_id)
         if not folders:
@@ -706,11 +756,13 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
+    # ========== زر إيقاف الانضمام ==========
     if text == "🛑 إيقاف الانضمام":
         running_states[user_id] = False
         await update.message.reply_text("⏳ جاري الإيقاف...")
         return
 
+    # ========== زر حالة النظام ==========
     if text == "📊 حالة النظام":
         cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
         row = cursor.fetchone()
@@ -731,6 +783,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if res:
                 folder_name = res[0]
 
+        # جلب إحصائيات الروابط
         cursor.execute("SELECT COUNT(*) FROM links WHERE user_id=? AND status='pending'", (user_id,))
         pending_links = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM links WHERE user_id=? AND status='completed'", (user_id,))
@@ -741,18 +794,9 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_folders = cursor.fetchone()[0]
 
         is_running = "🔥 يعمل" if running_states.get(user_id) else "⚪ متوقف"
-
-        expiry = get_subscription_expiry(user_id)
-        expiry_display = expiry if expiry else "لا يوجد"
-        if expiry:
-            try:
-                expiry_date = datetime.fromisoformat(expiry)
-                if expiry_date <= datetime.now():
-                    expiry_display = "منتهي (جدد)"
-                else:
-                    expiry_display = expiry
-            except:
-                expiry_display = "خطأ"
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        bal = cursor.fetchone()[0]
+        bal_str = "مفتوحة" if user_id == ADMIN_ID else f"{bal} نقطة"
 
         await update.message.reply_text(
             f"📋 **حالة النظام التفصيلية**\n\n"
@@ -761,7 +805,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• **الوقت بين الروابط:** {delay} ثانية\n"
             f"• **استراحة كل 5 روابط:** {rest} دقائق\n"
             f"• **المجلد المختار:** {folder_name}\n"
-            f"📅 **الاشتراك:** {expiry_display}\n\n"
+            f"• **رصيدك:** {bal_str}\n\n"
             f"📊 **إحصائيات الروابط:**\n"
             f"• 📁 **عدد المجلدات:** {total_folders}\n"
             f"• ⏳ **روابط معلقة:** {pending_links}\n"
@@ -770,7 +814,22 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ========== زر مسح الروابط ==========
     if text == "🗑️ مسح الروابط":
+        # التحقق من الاشتراك
+        if user_id != ADMIN_ID:
+            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+            if not is_subscribed:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+                ])
+                await update.message.reply_text(
+                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                    reply_markup=keyboard
+                )
+                return
+
         folders = get_user_folders(user_id)
         if not folders:
             await update.message.reply_text("⚠️ لا توجد مجلدات لحذفها.")
@@ -781,12 +840,39 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
+    # ========== زر سحب روابطي (تم حذفه من الأزرار العامة، لكن نتركه للتوافق) ==========
+    if text == "📂 سحب روابطي":
+        # هذا الزر تم إزالته، ولكن إذا وصلنا هنا نعطي رسالة أو ننفذ الوظيفة القديمة
+        await fetch_user_links(update, context)
+        return
+
+    # ========== زر سحب روابط المستخدمين (للمشرف فقط) ==========
+    if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
+        await fetch_user_links(update, context)
+        return
+
+    # ========== زر تسجيل الدخول ==========
     if text == "📱 تسجيل الدخول الجديد":
         await update.message.reply_text("أرسل رقم الهاتف مع رمز الدولة (مثال: +966500000000):")
         context.user_data['action'] = 'login_phone'
         return
 
+    # ========== زر أرقامي المسجلة ==========
     if text == "📱 أرقامي المسجلة":
+        # التحقق من الاشتراك
+        if user_id != ADMIN_ID:
+            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+            if not is_subscribed:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+                ])
+                await update.message.reply_text(
+                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                    reply_markup=keyboard
+                )
+                return
+
         cursor.execute("SELECT phone, is_active FROM accounts WHERE user_id=?", (user_id,))
         accounts = cursor.fetchall()
         if not accounts:
@@ -801,7 +887,22 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
+    # ========== زر حذف رقم مسجل ==========
     if text == "🗑️ حذف رقم مسجل":
+        # التحقق من الاشتراك
+        if user_id != ADMIN_ID:
+            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
+            if not is_subscribed:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
+                ])
+                await update.message.reply_text(
+                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
+                    reply_markup=keyboard
+                )
+                return
+
         cursor.execute("SELECT phone FROM accounts WHERE user_id=?", (user_id,))
         accounts = cursor.fetchall()
         if not accounts:
@@ -815,6 +916,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
+    # ========== زر تحديد الوقت ==========
     if text == "⏱️ تحديد الوقت":
         cursor.execute("SELECT delay FROM users WHERE user_id=?", (user_id,))
         row = cursor.fetchone()
@@ -823,6 +925,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['action'] = 'set_delay'
         return
 
+    # ========== زر استراحة كل 5 روابط ==========
     if text == "💤 استراحة كل 5 روابط":
         cursor.execute("SELECT rest_time FROM users WHERE user_id=?", (user_id,))
         row = cursor.fetchone()
@@ -831,23 +934,28 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['action'] = 'set_rest_time'
         return
 
-    # ========== أزرار المطور الأخرى ==========
+    # ========== أزرار المطور ==========
     if text == "👑 لوحة المطور" and user_id == ADMIN_ID:
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM accounts")
         total_accounts = cursor.fetchone()[0]
         cursor.execute("""
-            SELECT users.user_id, users.subscription_expiry
-            FROM users
+            SELECT users.user_id, users.balance, COUNT(accounts.id) 
+            FROM users 
+            LEFT JOIN accounts ON users.user_id = accounts.user_id 
+            GROUP BY users.user_id
         """)
         details = cursor.fetchall()
         admin_reply = f"👑 **لوحة المطور**\n👥 المستخدمين: {total_users}\n📱 الأرقام: {total_accounts}\n\n"
-        admin_reply += "📋 **المستخدمون والاشتراكات:**\n"
-        for u_id, expiry in details:
-            expiry_str = expiry if expiry else "بدون"
-            admin_reply += f"• {u_id} → اشتراك: {expiry_str}\n"
+        for u_id, bal, count in details:
+            admin_reply += f"• المستخدم `{u_id}`: نقاط {bal} | أرقام {count}\n"
         await update.message.reply_text(admin_reply, parse_mode="Markdown")
+        return
+
+    if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل معرف المستخدم:")
+        context.user_data['action'] = 'admin_charge_id'
         return
 
     if text == "📢 إذاعة رسالة عامة" and user_id == ADMIN_ID:
@@ -897,94 +1005,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== إضافة اشتراك (للمشرف) ==========
-    if action == 'admin_add_subscription_id' and user_id == ADMIN_ID:
-        try:
-            target_uid = int(text)
-            context.user_data['target_subscription_uid'] = target_uid
-            await update.message.reply_text(f"🔹 المستهدف: `{target_uid}`\nأرسل عدد الأيام (مثال: 30):")
-            context.user_data['action'] = 'admin_add_subscription_days'
-        except ValueError:
-            await update.message.reply_text("❌ معرف غير صحيح.")
-            context.user_data.clear()
-        return
-
-    if action == 'admin_add_subscription_days' and user_id == ADMIN_ID:
-        try:
-            days = int(text)
-            if days <= 0:
-                raise ValueError
-            target = context.user_data.get('target_subscription_uid')
-            if not target:
-                await update.message.reply_text("❌ حدث خطأ، حاول مجدداً.")
-                context.user_data.clear()
-                return
-            cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,))
-            add_subscription(target, days)
-            await update.message.reply_text(f"✅ تم إضافة اشتراك لمدة {days} يوم للمستخدم `{target}`")
-            try:
-                await context.bot.send_message(chat_id=target, text=f"🎉 تم تفعيل اشتراكك لمدة {days} يوم.")
-            except:
-                pass
-        except ValueError:
-            await update.message.reply_text("❌ يرجى إرسال عدد صحيح للأيام.")
-        context.user_data.clear()
-        return
-
-    # ========== حذف اشتراك (للمشرف) ==========
-    if action == 'admin_remove_subscription' and user_id == ADMIN_ID:
-        try:
-            target_uid = int(text)
-            cursor.execute("SELECT subscription_expiry FROM users WHERE user_id=?", (target_uid,))
-            row = cursor.fetchone()
-            if not row or not row[0]:
-                await update.message.reply_text(f"⚠️ المستخدم `{target_uid}` ليس لديه اشتراك نشط.")
-                context.user_data.clear()
-                return
-            remove_subscription(target_uid)
-            await update.message.reply_text(f"✅ تم حذف اشتراك المستخدم `{target_uid}`")
-            try:
-                await context.bot.send_message(chat_id=target_uid, text="⚠️ تم حذف اشتراكك.")
-            except:
-                pass
-        except ValueError:
-            await update.message.reply_text("❌ معرف غير صحيح.")
-        context.user_data.clear()
-        return
-
-    # ========== سحب روابط المستخدم (للمشرف) ==========
-    if action == 'admin_fetch_user_links' and user_id == ADMIN_ID:
-        try:
-            target_uid = int(text)
-            await handle_fetch_user_links(update, context, target_uid)
-        except ValueError:
-            await update.message.reply_text("❌ يرجى إدخال معرف رقمي صحيح.")
-        context.user_data.clear()
-        return
-
-    # ========== إذاعة (للمشرف) ==========
-    if action == 'admin_broadcast' and user_id == ADMIN_ID:
-        if text == "/cancel":
-            context.user_data.clear()
-            await update.message.reply_text("❌ تم إلغاء الإذاعة.")
-            return
-        cursor.execute("SELECT user_id FROM users")
-        all_users = cursor.fetchall()
-        success = 0
-        fail = 0
-        await update.message.reply_text(f"🚀 جاري الإرسال إلى {len(all_users)} مستخدم...")
-        for (u_id,) in all_users:
-            try:
-                await context.bot.send_message(chat_id=u_id, text=text)
-                success += 1
-                await asyncio.sleep(0.05)
-            except:
-                fail += 1
-        context.user_data.clear()
-        await update.message.reply_text(f"✅ تم الإرسال: {success} نجاح، {fail} فشل.")
-        return
-
-    # ========== تسجيل الدخول ==========
+    # ========== معالجة تسجيل الدخول ==========
     if action == 'login_phone':
         context.user_data['temp_phone'] = text
         await update.message.reply_text("⏳ جاري إرسال كود التحقق...\nأرسل الكود فور وصوله:")
@@ -1019,6 +1040,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
         return
 
+    # ========== معالجة تبديل الحساب ==========
     if action == 'switch_account':
         cursor.execute("SELECT id FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
         acc = cursor.fetchone()
@@ -1032,6 +1054,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
+    # ========== معالجة حذف حساب ==========
     if action == 'delete_account':
         cursor.execute("SELECT id, is_active FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
         acc = cursor.fetchone()
@@ -1049,13 +1072,75 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
+    # ========== معالجة أوامر المطور الخاصة ==========
+    if action == 'admin_fetch_user_links' and user_id == ADMIN_ID:
+        try:
+            target_uid = int(text)
+            await handle_fetch_user_links(update, context, target_uid)
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إدخال معرف رقمي صحيح.")
+        context.user_data.clear()
+        return
+
+    if action == 'admin_broadcast' and user_id == ADMIN_ID:
+        if text == "/cancel":
+            context.user_data.clear()
+            await update.message.reply_text("❌ تم إلغاء الإذاعة.")
+            return
+        cursor.execute("SELECT user_id FROM users")
+        all_users = cursor.fetchall()
+        success = 0
+        fail = 0
+        await update.message.reply_text(f"🚀 جاري الإرسال إلى {len(all_users)} مستخدم...")
+        for (u_id,) in all_users:
+            try:
+                await context.bot.send_message(chat_id=u_id, text=text)
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                fail += 1
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ تم الإرسال: {success} نجاح، {fail} فشل.")
+        return
+
+    if action == 'admin_charge_id' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            context.user_data['target_charge_id'] = target
+            await update.message.reply_text(f"🔋 المستهدف: `{target}`\nأرسل عدد النقاط:")
+            context.user_data['action'] = 'admin_charge_amount'
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+            context.user_data.clear()
+        return
+
+    if action == 'admin_charge_amount' and user_id == ADMIN_ID:
+        try:
+            amount = int(text)
+            target = context.user_data.get('target_charge_id')
+            cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (target,))
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target))
+            db.commit()
+            cursor.execute("SELECT balance FROM users WHERE user_id=?", (target,))
+            new_bal = cursor.fetchone()[0]
+            await update.message.reply_text(f"✅ تم إضافة {amount} نقطة للمستخدم `{target}`\nرصيده الآن: {new_bal}")
+            try:
+                await context.bot.send_message(chat_id=target, text=f"🎉 تم شحن {amount} نقطة، رصيدك الآن: {new_bal}")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ أرسل عدد صحيح.")
+        context.user_data.clear()
+        return
+
+    # إذا لم يتطابق أي شيء
     await update.message.reply_text("⚠️ زر غير معروف أو حدث خطأ، يرجى استخدام الأزرار المتاحة.")
 
 # ========== تشغيل البوت ==========
 if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
-    app.add_handler(CommandHandler("start", handle_msg))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع الاشتراك الإجباري (باستخدام البوت للتحقق)...")
+    print("🚀 البوت يعمل بكامل ميزاته مع الاشتراك الإجباري...")
     app.run_polling()
