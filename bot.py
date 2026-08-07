@@ -14,9 +14,6 @@ API_HASH = "a5dcef068387dd95705046f910d6cd48"
 
 ADMIN_ID = 5064913080
 
-# قناة الاشتراك الإجباري (ضع المعرف بدون @)
-REQUIRED_CHANNEL = "ATLe1240"
-
 # متغير عام للتحكم في إيقاف البوت (للمشرف فقط)
 BOT_PAUSED = False
 
@@ -98,26 +95,6 @@ def delete_folder_and_links(folder_id):
     cursor.execute("DELETE FROM folders WHERE id=?", (folder_id,))
     db.commit()
 
-# ========== دالة التحقق من الاشتراك في القناة الإجبارية (باستخدام البوت) ==========
-async def check_channel_subscription(user_id, context):
-    """تتحقق من أن المستخدم مشترك في القناة الإجبارية باستخدام البوت نفسه."""
-    if user_id == ADMIN_ID:
-        return True, "✅ المشرف معفي من الاشتراك الإجباري"
-    try:
-        chat_member = await context.bot.get_chat_member(chat_id=f"@{REQUIRED_CHANNEL}", user_id=user_id)
-        if chat_member.status in ["member", "administrator", "creator"]:
-            return True, "✅ أنت مشترك في القناة الإجبارية"
-        else:
-            return False, f"❌ أنت غير مشترك في قناة الاشتراك الإجباري.\nيرجى الاشتراك عبر الرابط: https://t.me/{REQUIRED_CHANNEL}"
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "user not found" in error_msg or "chat not found" in error_msg:
-            return False, f"❌ لم يتم العثور على القناة. تأكد من أن البوت مشرف في القناة @{REQUIRED_CHANNEL}"
-        elif "not enough rights" in error_msg or "bot" in error_msg:
-            return False, f"❌ البوت ليس لديه صلاحية كافية. يجب أن يكون البوت مشرفاً (Admin) في القناة @{REQUIRED_CHANNEL}"
-        else:
-            return False, f"❌ حدث خطأ أثناء التحقق: {str(e)}"
-
 # ========== منطق الانضمام ==========
 async def join_logic(session_str, link):
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
@@ -176,23 +153,20 @@ async def join_logic(session_str, link):
     finally:
         await client.disconnect()
 
-# ========== دالة الخلفية للانضمام (معدلة) ==========
+# ========== دالة الخلفية للانضمام ==========
 async def background_join_task(user_id, context, active_acc, delay_time, rest_time_minutes, folder_id, folder_name):
     try:
         join_counter = 0
         local_db = sqlite3.connect("bot_final.db")
         local_cursor = local_db.cursor()
 
-        # جلب جميع الروابط المعلقة في المجلد مع معرفاتها
         local_cursor.execute("SELECT id, link FROM links WHERE folder_id=? AND status='pending'", (folder_id,))
-        all_links = local_cursor.fetchall()
-        total_links = len(all_links)
-        
-        if not all_links:
+        links = local_cursor.fetchall()
+        if not links:
             await context.bot.send_message(chat_id=user_id, text="⚠️ لا توجد روابط معلقة في هذا المجلد.")
             return
 
-        for index, (lid, link) in enumerate(all_links, 1):
+        for lid, link in links:
             if not running_states.get(user_id):
                 break
 
@@ -236,32 +210,20 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                     await context.bot.send_message(chat_id=user_id, text="🔄 إعادة محاولة الانضمام...")
                     continue
 
-                # تحديث حالة الرابط
                 local_cursor.execute("UPDATE links SET status=? WHERE id=?", ('completed' if status == "SUCCESS" else 'failed', lid))
                 if user_id != ADMIN_ID:
                     local_cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (user_id,))
                 local_db.commit()
 
                 join_counter += 1
-                
-                # حساب الروابط المتبقية
-                remaining_links = total_links - index
 
                 local_cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
                 rem_bal = local_cursor.fetchone()[0]
                 bal_str = "المشرف (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{rem_bal} نقطة"
 
-                # إرسال رسالة محسنة تحتوي على معلومات المجلد والرابط
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"📁 **المجلد:** {folder_name}\n"
-                         f"🔗 **الرابط رقم:** {index} من {total_links}\n"
-                         f"📊 **المتبقي:** {remaining_links} رابط\n"
-                         f"📱 **الرقم:** {active_acc[1]}\n"
-                         f"🔗 **الرابط:** {link}\n"
-                         f"📌 **النتيجة:** {msg}\n"
-                         f"🎯 **نقاطك:** {bal_str}",
-                    parse_mode="Markdown"
+                    text=f"📱 الرقم: {active_acc[1]}\n🔗 الرابط: {link}\nالنتيجة: {msg}\n🎯 نقاطك: {bal_str}"
                 )
                 break
 
@@ -303,7 +265,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("🎯 شحن نقاطك"), KeyboardButton("📁 مجلدات الروابط")]
     ]
 
-    # أزرار المشرف
+    # أزرار المشرف (إيقاف/تشغيل البوت)
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
         keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("🔋 شحن نقاط لمعلم")])
@@ -312,6 +274,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     balance_display = "المشرف العام (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{balance} نقطة"
 
+    # رسالة توقف البوت إن كان متوقفاً
     paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
 
     await update.message.reply_text(
@@ -324,128 +287,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ========== معالجة سحب روابط المستخدم (للمشرف) ==========
-async def fetch_user_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if user_id != ADMIN_ID:
-        # للمستخدم العادي: يعرض روابطه الخاصة
-        cursor.execute("""
-            SELECT link, status, folder_id 
-            FROM links 
-            WHERE user_id=?
-            ORDER BY folder_id, id
-        """, (user_id,))
-        user_links = cursor.fetchall()
-        if not user_links:
-            await update.message.reply_text("📂 ليس لديك أي روابط مسجلة.")
-            return
-        
-        folders = {}
-        for link, status, folder_id in user_links:
-            if folder_id not in folders:
-                cursor.execute("SELECT folder_name FROM folders WHERE id=?", (folder_id,))
-                folder_name = cursor.fetchone()
-                folders[folder_id] = {
-                    'name': folder_name[0] if folder_name else f"مجلد {folder_id}",
-                    'links': []
-                }
-            folders[folder_id]['links'].append((link, status))
-        
-        msg = f"📂 **روابطك المسجلة**\n\n"
-        for folder_id, folder_data in folders.items():
-            msg += f"📁 **{folder_data['name']}**\n"
-            for link, status in folder_data['links']:
-                status_icon = "✅" if status == 'completed' else ("❌" if status == 'failed' else "⏳")
-                formatted_link = link if ("http://" in link or "https://" in link) else f"https://t.me/{link}"
-                msg += f"{status_icon} {formatted_link}\n"
-            msg += "\n"
-        
-        if len(msg) > 4000:
-            parts = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
-            for part in parts:
-                await update.message.reply_text(part, parse_mode="Markdown", disable_web_page_preview=False)
-        else:
-            await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=False)
-        return
-
-    # للمشرف: يعرض إحصائيات المستخدمين
-    cursor.execute("""
-        SELECT users.user_id, COUNT(links.id) 
-        FROM users 
-        LEFT JOIN links ON users.user_id = links.user_id 
-        GROUP BY users.user_id
-    """)
-    data = cursor.fetchall()
-    
-    if not data:
-        await update.message.reply_text("📂 لا توجد أي روابط مسجلة في البوت حالياً.")
-        return
-    
-    reply = "📂 **إحصائيات المستخدمين والروابط:**\n\n"
-    for uid, count in data:
-        reply += f"• المستخدم: `{uid}` → عدد الروابط: ({count})\n"
-    
-    reply += "\n👇 **للمشرف فقط:** أرسل معرف المستخدم (User ID) الذي تريد سحب روابطه."
-    
-    await update.message.reply_text(reply, parse_mode="Markdown")
-    context.user_data['action'] = 'admin_fetch_user_links'
-
-# ========== معالجة سحب روابط المستخدم (بعد إرسال المعرف) ==========
-async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_TYPE, target_uid):
-    try:
-        # جلب جميع روابط المستخدم بجميع حالاتها
-        cursor.execute("""
-            SELECT link, status, folder_id 
-            FROM links 
-            WHERE user_id=?
-            ORDER BY folder_id, id
-        """, (target_uid,))
-        user_links = cursor.fetchall()
-        
-        if not user_links:
-            await update.message.reply_text(f"⚠️ لا توجد أي روابط مسجلة للمستخدم `{target_uid}`", parse_mode="Markdown")
-            return
-        
-        # تجميع الروابط حسب المجلد
-        folders = {}
-        for link, status, folder_id in user_links:
-            if folder_id not in folders:
-                cursor.execute("SELECT folder_name FROM folders WHERE id=?", (folder_id,))
-                folder_name = cursor.fetchone()
-                folders[folder_id] = {
-                    'name': folder_name[0] if folder_name else f"مجلد {folder_id}",
-                    'links': []
-                }
-            folders[folder_id]['links'].append((link, status))
-        
-        total_links = len(user_links)
-        
-        # إرسال الروابط مع أزرار قابلة للضغط
-        msg = f"📂 **روابط المستخدم `{target_uid}`**\n"
-        msg += f"📊 **إجمالي الروابط:** {total_links}\n\n"
-        
-        # إرسال كل مجلد على حدة
-        for folder_id, folder_data in folders.items():
-            msg += f"📁 **{folder_data['name']}**\n"
-            for link, status in folder_data['links']:
-                status_icon = "✅" if status == 'completed' else ("❌" if status == 'failed' else "⏳")
-                # جعل الرابط قابل للضغط والنقر
-                formatted_link = link if ("http://" in link or "https://" in link) else f"https://t.me/{link}"
-                msg += f"{status_icon} {formatted_link}\n"
-            msg += "\n"
-        
-        # تقسيم الرسالة إذا كانت طويلة
-        if len(msg) > 4000:
-            parts = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
-            for part in parts:
-                await update.message.reply_text(part, parse_mode="Markdown", disable_web_page_preview=False)
-        else:
-            await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=False)
-            
-    except Exception as e:
-        await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
-
 # ========== معالجة الكولباك ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -456,24 +297,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cancel":
         await query.edit_message_text("❌ تم الإلغاء.")
         context.user_data.clear()
-        return
-
-    # ========== التحقق من الاشتراك ==========
-    if data == "check_subscription":
-        is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-        if is_subscribed:
-            await query.edit_message_text("✅ تم التحقق بنجاح! أنت مشترك في القناة.")
-            # إعادة إرسال الترحيب (يمكن استخدام دالة start مباشرة)
-            await start(update, context)
-        else:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-            ])
-            await query.edit_message_text(
-                f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                reply_markup=keyboard
-            )
         return
 
     # ------ اختيار مجلد للانضمام ------
@@ -505,9 +328,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         reply = f"📁 **{folder_name}**\nروابط معلقة ({len(links)}):\n\n"
         for idx, (lid, link, status) in enumerate(links, 1):
-            formatted_link = link if ("http://" in link or "https://" in link) else f"https://t.me/{link}"
-            reply += f"{idx}. {formatted_link}\n"
-        await query.edit_message_text(reply, parse_mode="Markdown", disable_web_page_preview=False)
+            reply += f"{idx}. {link}\n"
+        await query.edit_message_text(reply, parse_mode="Markdown")
         return
 
     # ------ حذف مجلد ------
@@ -613,19 +435,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.commit()
 
     if text == "/start":
-        # التحقق من الاشتراك الإجباري قبل عرض الترحيب
-        if user_id != ADMIN_ID:
-            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-            if not is_subscribed:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-                ])
-                await update.message.reply_text(
-                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                    reply_markup=keyboard
-                )
-                return
         return await start(update, context)
 
     # ========== أزرار المشرف لإيقاف/تشغيل البوت ==========
@@ -649,20 +458,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== زر مجلدات الروابط ==========
     if text == "📁 مجلدات الروابط":
-        # التحقق من الاشتراك
-        if user_id != ADMIN_ID:
-            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-            if not is_subscribed:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-                ])
-                await update.message.reply_text(
-                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                    reply_markup=keyboard
-                )
-                return
-
         folders = get_user_folders(user_id)
         if not folders:
             await update.message.reply_text("📁 لا توجد مجلدات حالياً. أرسل روابط واحفظها لإنشاء مجلد جديد.")
@@ -698,20 +493,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== زر إرسال روابط ==========
     if text == "🔗 إرسال روابط":
-        # التحقق من الاشتراك
-        if user_id != ADMIN_ID:
-            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-            if not is_subscribed:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-                ])
-                await update.message.reply_text(
-                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                    reply_markup=keyboard
-                )
-                return
-
         await update.message.reply_text(
             "📥 أرسل الروابط تباعاً، ثم اضغط على زر (📥 حفظ الروابط وإنهاء الإرسال).",
             reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📥 حفظ الروابط وإنهاء الإرسال")]], resize_keyboard=True)
@@ -725,20 +506,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if running_states.get(user_id) == True:
             await update.message.reply_text("⚠️ هناك عملية جارية بالفعل.")
             return
-
-        # التحقق من الاشتراك
-        if user_id != ADMIN_ID:
-            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-            if not is_subscribed:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-                ])
-                await update.message.reply_text(
-                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                    reply_markup=keyboard
-                )
-                return
 
         folders = get_user_folders(user_id)
         if not folders:
@@ -783,53 +550,24 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if res:
                 folder_name = res[0]
 
-        # جلب إحصائيات الروابط
-        cursor.execute("SELECT COUNT(*) FROM links WHERE user_id=? AND status='pending'", (user_id,))
-        pending_links = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM links WHERE user_id=? AND status='completed'", (user_id,))
-        completed_links = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM links WHERE user_id=? AND status='failed'", (user_id,))
-        failed_links = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM folders WHERE user_id=?", (user_id,))
-        total_folders = cursor.fetchone()[0]
-
         is_running = "🔥 يعمل" if running_states.get(user_id) else "⚪ متوقف"
         cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
         bal = cursor.fetchone()[0]
         bal_str = "مفتوحة" if user_id == ADMIN_ID else f"{bal} نقطة"
 
         await update.message.reply_text(
-            f"📋 **حالة النظام التفصيلية**\n\n"
-            f"• **حالة البوت:** {is_running}\n"
-            f"• **الرقم النشط:** {active_phone}\n"
-            f"• **الوقت بين الروابط:** {delay} ثانية\n"
-            f"• **استراحة كل 5 روابط:** {rest} دقائق\n"
-            f"• **المجلد المختار:** {folder_name}\n"
-            f"• **رصيدك:** {bal_str}\n\n"
-            f"📊 **إحصائيات الروابط:**\n"
-            f"• 📁 **عدد المجلدات:** {total_folders}\n"
-            f"• ⏳ **روابط معلقة:** {pending_links}\n"
-            f"• ✅ **روابط منضم لها:** {completed_links}\n"
-            f"• ❌ **روابط فاشلة:** {failed_links}"
+            f"📋 **حالة النظام**\n\n"
+            f"• الحالة: {is_running}\n"
+            f"• الرقم النشط: {active_phone}\n"
+            f"• الوقت بين الروابط: {delay} ثانية\n"
+            f"• استراحة كل 5 روابط: {rest} دقائق\n"
+            f"• المجلد المختار: {folder_name}\n"
+            f"• رصيدك: {bal_str}"
         )
         return
 
     # ========== زر مسح الروابط ==========
     if text == "🗑️ مسح الروابط":
-        # التحقق من الاشتراك
-        if user_id != ADMIN_ID:
-            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-            if not is_subscribed:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-                ])
-                await update.message.reply_text(
-                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                    reply_markup=keyboard
-                )
-                return
-
         folders = get_user_folders(user_id)
         if not folders:
             await update.message.reply_text("⚠️ لا توجد مجلدات لحذفها.")
@@ -840,17 +578,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # ========== زر سحب روابطي (تم حذفه من الأزرار العامة، لكن نتركه للتوافق) ==========
-    if text == "📂 سحب روابطي":
-        # هذا الزر تم إزالته، ولكن إذا وصلنا هنا نعطي رسالة أو ننفذ الوظيفة القديمة
-        await fetch_user_links(update, context)
-        return
-
-    # ========== زر سحب روابط المستخدمين (للمشرف فقط) ==========
-    if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
-        await fetch_user_links(update, context)
-        return
-
     # ========== زر تسجيل الدخول ==========
     if text == "📱 تسجيل الدخول الجديد":
         await update.message.reply_text("أرسل رقم الهاتف مع رمز الدولة (مثال: +966500000000):")
@@ -859,20 +586,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== زر أرقامي المسجلة ==========
     if text == "📱 أرقامي المسجلة":
-        # التحقق من الاشتراك
-        if user_id != ADMIN_ID:
-            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-            if not is_subscribed:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-                ])
-                await update.message.reply_text(
-                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                    reply_markup=keyboard
-                )
-                return
-
         cursor.execute("SELECT phone, is_active FROM accounts WHERE user_id=?", (user_id,))
         accounts = cursor.fetchall()
         if not accounts:
@@ -889,20 +602,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== زر حذف رقم مسجل ==========
     if text == "🗑️ حذف رقم مسجل":
-        # التحقق من الاشتراك
-        if user_id != ADMIN_ID:
-            is_subscribed, sub_msg = await check_channel_subscription(user_id, context)
-            if not is_subscribed:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{REQUIRED_CHANNEL}")],
-                    [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")]
-                ])
-                await update.message.reply_text(
-                    f"{sub_msg}\n\nبعد الاشتراك، اضغط على زر التحقق.",
-                    reply_markup=keyboard
-                )
-                return
-
         cursor.execute("SELECT phone FROM accounts WHERE user_id=?", (user_id,))
         accounts = cursor.fetchall()
         if not accounts:
@@ -961,6 +660,25 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📢 إذاعة رسالة عامة" and user_id == ADMIN_ID:
         await update.message.reply_text("أرسل الرسالة للإذاعة (أو /cancel):")
         context.user_data['action'] = 'admin_broadcast'
+        return
+
+    if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
+        cursor.execute("""
+            SELECT users.user_id, COUNT(links.id) 
+            FROM users 
+            LEFT JOIN links ON users.user_id = links.user_id 
+            GROUP BY users.user_id
+        """)
+        data = cursor.fetchall()
+        if not data:
+            await update.message.reply_text("لا توجد بيانات.")
+            return
+        reply = "📂 **إحصائيات المستخدمين:**\n\n"
+        for uid, cnt in data:
+            reply += f"• {uid} → {cnt} رابط\n"
+        reply += "\nأرسل معرف المستخدم لعرض روابطه."
+        context.user_data['action'] = 'admin_fetch_user_links'
+        await update.message.reply_text(reply, parse_mode="Markdown")
         return
 
     if text == "🗑️ حذف أرشيف الروابط" and user_id == ADMIN_ID:
@@ -1072,11 +790,21 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ========== معالجة أوامر المطور الخاصة ==========
+    # ========== معالجة أوامر المطور الأخرى ==========
     if action == 'admin_fetch_user_links' and user_id == ADMIN_ID:
         try:
             target_uid = int(text)
-            await handle_fetch_user_links(update, context, target_uid)
+            cursor.execute("SELECT link, status FROM links WHERE user_id=?", (target_uid,))
+            user_links = cursor.fetchall()
+            if not user_links:
+                await update.message.reply_text(f"⚠️ لا توجد روابط للمستخدم `{target_uid}`", parse_mode="Markdown")
+            else:
+                msg = f"📂 روابط المستخدم `{target_uid}`:\n\n"
+                for idx, (lnk, stat) in enumerate(user_links, 1):
+                    status_icon = "✅" if stat == 'completed' else ("❌" if stat == 'failed' else "⏳")
+                    formatted_link = lnk if ("http://" in lnk or "https://" in lnk) else f"https://t.me/{lnk}"
+                    msg += f"{idx}. {status_icon} {formatted_link}\n"
+                await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
         except ValueError:
             await update.message.reply_text("❌ يرجى إدخال معرف رقمي صحيح.")
         context.user_data.clear()
@@ -1142,5 +870,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل بكامل ميزاته مع الاشتراك الإجباري...")
+    print("🚀 البوت يعمل مع ميزة الإيقاف/التشغيل للمشرف...")
     app.run_polling()
