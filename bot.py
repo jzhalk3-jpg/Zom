@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY, 
     delay INTEGER DEFAULT 10,
     rest_time INTEGER DEFAULT 5,
-    balance INTEGER DEFAULT 0
+    balance INTEGER DEFAULT 0,
+    multi_join_permission INTEGER DEFAULT 0
 )
 """)
 cursor.execute("""
@@ -66,8 +67,14 @@ try:
     db.commit()
 except sqlite3.OperationalError:
     pass
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN multi_join_permission INTEGER DEFAULT 0")
+    db.commit()
+except sqlite3.OperationalError:
+    pass
 
-running_states = {}  # لحفظ حالة الانضمام
+running_states = {}  # لحفظ حالة الانضمام (للمستخدم)
+multi_running_states = {}  # user_id -> list of booleans (لكل حساب في الانضمام المتعدد)
 
 def extract_links(text):
     pattern = r"(?:https?://)?(?:t\.me/|telegram\.me/)([a-zA-Z0-9_]+|joinchat/[a-zA-Z0-9_-]+|\+[a-zA-Z0-9_-]+)"
@@ -93,6 +100,23 @@ def get_folder_links(folder_id):
 def delete_folder_and_links(folder_id):
     cursor.execute("DELETE FROM links WHERE folder_id=?", (folder_id,))
     cursor.execute("DELETE FROM folders WHERE id=?", (folder_id,))
+    db.commit()
+
+def has_multi_join_permission(user_id):
+    if user_id == ADMIN_ID:
+        return True
+    cursor.execute("SELECT multi_join_permission FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if row and row[0] == 1:
+        return True
+    return False
+
+def grant_multi_join_permission(user_id):
+    cursor.execute("UPDATE users SET multi_join_permission=1 WHERE user_id=?", (user_id,))
+    db.commit()
+
+def revoke_multi_join_permission(user_id):
+    cursor.execute("UPDATE users SET multi_join_permission=0 WHERE user_id=?", (user_id,))
     db.commit()
 
 # ========== منطق الانضمام ==========
@@ -153,8 +177,8 @@ async def join_logic(session_str, link):
     finally:
         await client.disconnect()
 
-# ========== دالة الخلفية للانضمام ==========
-async def background_join_task(user_id, context, active_acc, delay_time, rest_time_minutes, folder_id, folder_name):
+# ========== دالة الخلفية للانضمام (للرقم الواحد) ==========
+async def background_join_task(user_id, context, active_acc, delay_time, rest_time_minutes, folder_id, folder_name, stop_flag=None):
     try:
         join_counter = 0
         local_db = sqlite3.connect("bot_final.db")
@@ -163,35 +187,45 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
         local_cursor.execute("SELECT id, link FROM links WHERE folder_id=? AND status='pending'", (folder_id,))
         links = local_cursor.fetchall()
         if not links:
-            await context.bot.send_message(chat_id=user_id, text="⚠️ لا توجد روابط معلقة في هذا المجلد.")
+            await context.bot.send_message(chat_id=user_id, text=f"⚠️ لا توجد روابط معلقة في هذا المجلد (للرقم {active_acc[1]}).")
             return
 
         for lid, link in links:
-            if not running_states.get(user_id):
+            if stop_flag and not stop_flag():
+                await context.bot.send_message(chat_id=user_id, text=f"🛑 تم إيقاف الانضمام للرقم {active_acc[1]}.")
+                break
+            if not running_states.get(user_id, False) and not stop_flag:
                 break
 
             if user_id != ADMIN_ID:
                 local_cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
                 current_bal = local_cursor.fetchone()[0]
                 if current_bal < 1:
-                    await context.bot.send_message(chat_id=user_id, text="⚠️ نفدت نقاطك، يرجى شحنها.")
+                    await context.bot.send_message(chat_id=user_id, text=f"⚠️ نفدت نقاطك (للرقم {active_acc[1]})، يرجى شحنها.")
                     break
 
             if join_counter > 0 and join_counter % 5 == 0:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"⏳ استراحة لمدة {rest_time_minutes} دقائق بعد 5 روابط..."
+                    text=f"⏳ استراحة لمدة {rest_time_minutes} دقائق بعد 5 روابط (للرقم {active_acc[1]})..."
                 )
                 for _ in range(int(rest_time_minutes * 60 * 10)):
-                    if not running_states.get(user_id):
+                    if stop_flag and not stop_flag():
+                        break
+                    if not running_states.get(user_id, False) and not stop_flag:
                         break
                     await asyncio.sleep(0.1)
-                if not running_states.get(user_id):
+                if stop_flag and not stop_flag():
+                    await context.bot.send_message(chat_id=user_id, text=f"🛑 تم إيقاف الانضمام للرقم {active_acc[1]}.")
                     break
-                await context.bot.send_message(chat_id=user_id, text="🚀 استئناف العمل...")
+                if not running_states.get(user_id, False) and not stop_flag:
+                    break
+                await context.bot.send_message(chat_id=user_id, text=f"🚀 استئناف العمل للرقم {active_acc[1]}...")
 
             while True:
-                if not running_states.get(user_id):
+                if stop_flag and not stop_flag():
+                    break
+                if not running_states.get(user_id, False) and not stop_flag:
                     break
 
                 status, msg = await join_logic(active_acc[0], link)
@@ -199,15 +233,20 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                 if status == "RESTRICTED":
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"⚠️ الحساب مقيد، استراحة 5 دقائق ثم إعادة المحاولة للرابط: {link}"
+                        text=f"⚠️ الحساب {active_acc[1]} مقيد، استراحة 5 دقائق ثم إعادة المحاولة للرابط: {link}"
                     )
                     for _ in range(300 * 10):
-                        if not running_states.get(user_id):
+                        if stop_flag and not stop_flag():
+                            break
+                        if not running_states.get(user_id, False) and not stop_flag:
                             break
                         await asyncio.sleep(0.1)
-                    if not running_states.get(user_id):
+                    if stop_flag and not stop_flag():
+                        await context.bot.send_message(chat_id=user_id, text=f"🛑 تم إيقاف الانضمام للرقم {active_acc[1]}.")
                         break
-                    await context.bot.send_message(chat_id=user_id, text="🔄 إعادة محاولة الانضمام...")
+                    if not running_states.get(user_id, False) and not stop_flag:
+                        break
+                    await context.bot.send_message(chat_id=user_id, text=f"🔄 إعادة محاولة الانضمام للرقم {active_acc[1]}...")
                     continue
 
                 local_cursor.execute("UPDATE links SET status=? WHERE id=?", ('completed' if status == "SUCCESS" else 'failed', lid))
@@ -228,20 +267,25 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                 break
 
             for _ in range(int(delay_time * 10)):
-                if not running_states.get(user_id):
+                if stop_flag and not stop_flag():
+                    break
+                if not running_states.get(user_id, False) and not stop_flag:
                     break
                 await asyncio.sleep(0.1)
 
-        if not running_states.get(user_id):
-            await context.bot.send_message(chat_id=user_id, text="🛑 تم الإيقاف.")
-        else:
-            await context.bot.send_message(chat_id=user_id, text="🏁 انتهت معالجة المجلد بنجاح.")
+        if not running_states.get(user_id, False) and not stop_flag:
+            await context.bot.send_message(chat_id=user_id, text=f"🛑 تم إيقاف الانضمام للرقم {active_acc[1]}.")
+        elif not stop_flag:
+            await context.bot.send_message(chat_id=user_id, text=f"🏁 انتهت معالجة المجلد للرقم {active_acc[1]}.")
 
         local_db.close()
     except Exception as e:
-        logging.error(f"Error in background task: {e}")
+        logging.error(f"Error in background task for {active_acc[1]}: {e}")
     finally:
-        running_states[user_id] = False
+        if stop_flag:
+            pass
+        else:
+            running_states[user_id] = False
 
 # ========== دوال الأزرار ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,16 +309,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("🎯 شحن نقاطك"), KeyboardButton("📁 مجلدات الروابط")]
     ]
 
+    # إذا كان المستخدم لديه صلاحية الانضمام المتعدد أو هو المشرف
+    if has_multi_join_permission(user_id):
+        keyboard.append([KeyboardButton("🔀 انضمام متعدد"), KeyboardButton("🛑 إيقاف الانضمام المتعدد")])
+
     # أزرار المشرف (إيقاف/تشغيل البوت)
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
         keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("🔋 شحن نقاط لمعلم")])
         keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
         keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
+        keyboard.append([KeyboardButton("➕ منح انضمام متعدد"), KeyboardButton("➖ إلغاء انضمام متعدد")])
 
     balance_display = "المشرف العام (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{balance} نقطة"
 
-    # رسالة توقف البوت إن كان متوقفاً
     paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
 
     await update.message.reply_text(
@@ -299,7 +347,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # ------ اختيار مجلد للانضمام ------
+    # ------ اختيار مجلد للانضمام المتعدد ------
+    if data.startswith("multi_join_folder_"):
+        folder_id = int(data.split("_")[3])  # modified
+        cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
+        res = cursor.fetchone()
+        if not res:
+            await query.edit_message_text("⚠️ هذا المجلد غير موجود.")
+            return
+        folder_name = res[0]
+        await query.edit_message_text(f"✅ تم اختيار المجلد: **{folder_name}**")
+        # بدء الانضمام المتعدد
+        await start_multi_joining(update, context, user_id, folder_id, folder_name)
+        return
+
+    # ------ اختيار مجلد للانضمام (العادي) ------
     if data.startswith("join_folder_"):
         folder_id = int(data.split("_")[2])
         cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
@@ -416,6 +478,97 @@ async def start_joining(update, context, user_id, folder_id, folder_name):
         background_join_task(user_id, context, active_acc, delay_time, rest_time, folder_id, folder_name)
     )
 
+# ========== دالة الانضمام المتعدد ==========
+async def start_multi_joining(update, context, user_id, folder_id, folder_name):
+    # جلب جميع الحسابات النشطة للمستخدم
+    cursor.execute("SELECT session, phone FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
+    accounts = cursor.fetchall()
+    if not accounts:
+        await update.effective_message.reply_text("❌ لا توجد حسابات نشطة مسجلة.")
+        return
+
+    # التحقق من وجود روابط في المجلد
+    links = get_folder_links(folder_id)
+    if not links:
+        await update.effective_message.reply_text("⚠️ لا توجد روابط معلقة في هذا المجلد.")
+        return
+
+    # التحقق من الرصيد (لكل حساب سيتم خصم نقاط)
+    if user_id != ADMIN_ID:
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        bal = cursor.fetchone()[0]
+        total_needed = len(links) * len(accounts)
+        if bal < total_needed:
+            await update.effective_message.reply_text(
+                f"❌ رصيدك لا يكفي للانضمام المتعدد. تحتاج {total_needed} نقطة (لـ {len(accounts)} حسابات × {len(links)} رابط)، لديك {bal} نقطة.\nتواصل مع @Ra11_8h للشحن."
+            )
+            return
+
+    # جلب إعدادات الوقت
+    cursor.execute("SELECT delay, rest_time FROM users WHERE user_id=?", (user_id,))
+    user_conf = cursor.fetchone()
+    delay_time = user_conf[0] if user_conf else 10
+    rest_time = user_conf[1] if user_conf and user_conf[1] is not None else 5
+
+    # إعداد إشارة التوقف (قائمة من booleans)
+    stop_flags = [True] * len(accounts)  # سيتم تغييرها إلى False عند الإيقاف
+    multi_running_states[user_id] = stop_flags
+
+    # إرسال رسالة بدء
+    await update.effective_message.reply_text(
+        f"🚀 بدء الانضمام المتعدد من المجلد **{folder_name}** ({len(links)} رابط) باستخدام {len(accounts)} حسابات...\n"
+        f"سيتم إرسال تقارير لكل حساب على حدة."
+    )
+
+    # تشغيل مهمة لكل حساب
+    tasks = []
+    for i, acc in enumerate(accounts):
+        session_str, phone = acc
+        def make_stop_flag(index):
+            def stop_flag():
+                return multi_running_states.get(user_id, [False])[index] if index < len(multi_running_states.get(user_id, [])) else False
+            return stop_flag
+
+        stop_flag = make_stop_flag(i)
+        task = asyncio.create_task(
+            background_join_task(
+                user_id, context, (session_str, phone), delay_time, rest_time, folder_id, folder_name, stop_flag
+            )
+        )
+        tasks.append(task)
+
+    # حفظ المهام في context.user_data للإيقاف
+    context.user_data['multi_tasks'] = tasks
+    context.user_data['multi_folder'] = folder_name
+    context.user_data['multi_accounts_count'] = len(accounts)
+
+    await update.effective_message.reply_text(
+        f"✅ تم تشغيل {len(accounts)} مهمة انضمام متعدد.\n"
+        f"يمكنك إيقافها باستخدام زر '🛑 إيقاف الانضمام المتعدد'."
+    )
+
+# ========== دالة إيقاف الانضمام المتعدد ==========
+async def stop_multi_joining(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in multi_running_states:
+        await update.message.reply_text("⚠️ لا توجد عملية انضمام متعدد نشطة حالياً.")
+        return
+
+    # تعيين جميع الإشارات إلى False
+    for i in range(len(multi_running_states[user_id])):
+        multi_running_states[user_id][i] = False
+
+    # إلغاء المهام إذا كانت موجودة
+    tasks = context.user_data.get('multi_tasks', [])
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+
+    multi_running_states.pop(user_id, None)
+    context.user_data.pop('multi_tasks', None)
+    await update.message.reply_text("🛑 تم إيقاف جميع عمليات الانضمام المتعدد.")
+
 # ========== دالة معالجة الرسائل الرئيسية ==========
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_PAUSED
@@ -437,7 +590,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "/start":
         return await start(update, context)
 
-    # ========== أزرار المشرف لإيقاف/تشغيل البوت ==========
+    # ========== أزرار المشرف ==========
     if text == "⏹️ إيقاف البوت" and user_id == ADMIN_ID:
         BOT_PAUSED = True
         await update.message.reply_text("✅ تم إيقاف البوت. لن يستجيب لأي أوامر من المستخدمين العاديين.")
@@ -446,6 +599,33 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "▶️ تشغيل البوت" and user_id == ADMIN_ID:
         BOT_PAUSED = False
         await update.message.reply_text("✅ تم تشغيل البوت. جميع المستخدمين يمكنهم استخدام البوت الآن.")
+        return
+
+    if text == "🔀 انضمام متعدد" and has_multi_join_permission(user_id):
+        # عرض المجلدات لاختيار المجلد
+        folders = get_user_folders(user_id)
+        if not folders:
+            await update.message.reply_text("⚠️ لا توجد مجلدات. أرسل روابط واحفظها أولاً.")
+            return
+        reply = "📁 **اختر المجلد للانضمام المتعدد:**"
+        keyboard = [[InlineKeyboardButton(fname, callback_data=f"multi_join_folder_{fid}")] for fid, fname in folders]
+        keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+        await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if text == "🛑 إيقاف الانضمام المتعدد" and has_multi_join_permission(user_id):
+        await stop_multi_joining(update, context)
+        return
+
+    # ========== أزرار إدارة الصلاحيات (للمشرف فقط) ==========
+    if text == "➕ منح انضمام متعدد" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل معرف المستخدم (User ID) الذي تريد منحه صلاحية الانضمام المتعدد:")
+        context.user_data['action'] = 'admin_grant_multi_join'
+        return
+
+    if text == "➖ إلغاء انضمام متعدد" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل معرف المستخدم (User ID) الذي تريد إلغاء صلاحية الانضمام المتعدد له:")
+        context.user_data['action'] = 'admin_revoke_multi_join'
         return
 
     # ========== زر شحن النقاط ==========
@@ -503,7 +683,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== زر بدء الانضمام ==========
     if text == "🚀 بدء الانضمام":
-        if running_states.get(user_id) == True:
+        if running_states.get(user_id, False):
             await update.message.reply_text("⚠️ هناك عملية جارية بالفعل.")
             return
 
@@ -526,7 +706,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ========== زر إيقاف الانضمام ==========
     if text == "🛑 إيقاف الانضمام":
         running_states[user_id] = False
-        await update.message.reply_text("⏳ جاري الإيقاف...")
+        await update.message.reply_text("⏳ جاري إيقاف الانضمام العادي...")
         return
 
     # ========== زر حالة النظام ==========
@@ -550,15 +730,24 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if res:
                 folder_name = res[0]
 
-        is_running = "🔥 يعمل" if running_states.get(user_id) else "⚪ متوقف"
+        is_running = "🔥 يعمل" if running_states.get(user_id, False) else "⚪ متوقف"
         cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
         bal = cursor.fetchone()[0]
         bal_str = "مفتوحة" if user_id == ADMIN_ID else f"{bal} نقطة"
+
+        # عدد الحسابات النشطة
+        cursor.execute("SELECT COUNT(*) FROM accounts WHERE user_id=? AND is_active=1", (user_id,))
+        active_accounts_count = cursor.fetchone()[0]
+
+        # صلاحية الانضمام المتعدد
+        multi_perm = "نعم" if has_multi_join_permission(user_id) else "لا"
 
         await update.message.reply_text(
             f"📋 **حالة النظام**\n\n"
             f"• الحالة: {is_running}\n"
             f"• الرقم النشط: {active_phone}\n"
+            f"• عدد الحسابات النشطة: {active_accounts_count}\n"
+            f"• صلاحية الانضمام المتعدد: {multi_perm}\n"
             f"• الوقت بين الروابط: {delay} ثانية\n"
             f"• استراحة كل 5 روابط: {rest} دقائق\n"
             f"• المجلد المختار: {folder_name}\n"
@@ -640,15 +829,16 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("SELECT COUNT(*) FROM accounts")
         total_accounts = cursor.fetchone()[0]
         cursor.execute("""
-            SELECT users.user_id, users.balance, COUNT(accounts.id) 
+            SELECT users.user_id, users.balance, users.multi_join_permission, COUNT(accounts.id) 
             FROM users 
             LEFT JOIN accounts ON users.user_id = accounts.user_id 
             GROUP BY users.user_id
         """)
         details = cursor.fetchall()
         admin_reply = f"👑 **لوحة المطور**\n👥 المستخدمين: {total_users}\n📱 الأرقام: {total_accounts}\n\n"
-        for u_id, bal, count in details:
-            admin_reply += f"• المستخدم `{u_id}`: نقاط {bal} | أرقام {count}\n"
+        for u_id, bal, perm, count in details:
+            perm_str = "✅" if perm == 1 else "❌"
+            admin_reply += f"• المستخدم `{u_id}`: نقاط {bal} | أرقام {count} | متعدد {perm_str}\n"
         await update.message.reply_text(admin_reply, parse_mode="Markdown")
         return
 
@@ -720,6 +910,39 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ تم تحديث وقت الاستراحة إلى: {new_rest} دقائق.")
         except ValueError:
             await update.message.reply_text("❌ يرجى إرسال رقم صحيح (0 أو أكثر).")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة منح صلاحية الانضمام المتعدد ==========
+    if action == 'admin_grant_multi_join' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            # التأكد من وجود المستخدم
+            cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,))
+            grant_multi_join_permission(target)
+            await update.message.reply_text(f"✅ تم منح صلاحية الانضمام المتعدد للمستخدم `{target}`")
+            # إرسال إشعار للمستخدم
+            try:
+                await context.bot.send_message(chat_id=target, text="🎉 تم منحك صلاحية استخدام الانضمام المتعدد (أكثر من حساب في نفس الوقت). ستظهر لك الأزرار الجديدة.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة إلغاء صلاحية الانضمام المتعدد ==========
+    if action == 'admin_revoke_multi_join' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            revoke_multi_join_permission(target)
+            await update.message.reply_text(f"✅ تم إلغاء صلاحية الانضمام المتعدد للمستخدم `{target}`")
+            try:
+                await context.bot.send_message(chat_id=target, text="⚠️ تم إلغاء صلاحية الانضمام المتعدد الخاصة بك.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
         context.user_data.clear()
         return
 
@@ -870,5 +1093,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع ميزة الإيقاف/التشغيل للمشرف...")
+    print("🚀 البوت يعمل مع ميزة منح صلاحية الانضمام المتعدد للمستخدمين...")
     app.run_polling()
