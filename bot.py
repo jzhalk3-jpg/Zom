@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS users (
     rest_time INTEGER DEFAULT 5,
     balance INTEGER DEFAULT 0,
     multi_join_permission INTEGER DEFAULT 0,
-    is_banned INTEGER DEFAULT 0
+    is_banned INTEGER DEFAULT 0,
+    is_exempted INTEGER DEFAULT 0
 )
 """)
 cursor.execute("""
@@ -71,6 +72,19 @@ CREATE TABLE IF NOT EXISTS multi_join_progress (
     PRIMARY KEY (user_id, account_id, folder_id)
 )
 """)
+# جدول طلبات الشحن
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS charge_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    package TEXT,
+    amount INTEGER,
+    price INTEGER,
+    status TEXT DEFAULT 'pending',  -- pending, completed, cancelled
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    photo_file_id TEXT
+)
+""")
 db.commit()
 
 # ترقية الجداول القديمة
@@ -89,10 +103,17 @@ try:
     db.commit()
 except sqlite3.OperationalError:
     pass
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN is_exempted INTEGER DEFAULT 0")
+    db.commit()
+except sqlite3.OperationalError:
+    pass
 
 running_states = {}
 multi_running_states = {}
 global_pause = {}
+# متغير لتتبع حالة شحن المستخدم (حفظ الباقة المختارة)
+user_charge_state = {}  # user_id -> {'package': str, 'points': int, 'price': int}
 
 PAUSE_DURATION_SECONDS = 300
 
@@ -171,6 +192,33 @@ def ban_user(user_id):
 
 def unban_user(user_id):
     cursor.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (user_id,))
+    db.commit()
+
+# ========== دوال الاستثناء من توقف البوت ==========
+def is_user_exempted(user_id):
+    if user_id == ADMIN_ID:
+        return True
+    cursor.execute("SELECT is_exempted FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if row and row[0] == 1:
+        return True
+    return False
+
+def set_user_exempted(user_id, value):
+    cursor.execute("UPDATE users SET is_exempted=? WHERE user_id=?", (1 if value else 0, user_id))
+    db.commit()
+
+# ========== دوال الشحن ==========
+def save_charge_request(user_id, package, points, price, photo_file_id=None):
+    cursor.execute("""
+        INSERT INTO charge_requests (user_id, package, amount, price, photo_file_id)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, package, points, price, photo_file_id))
+    db.commit()
+    return cursor.lastrowid
+
+def update_charge_request_status(request_id, status):
+    cursor.execute("UPDATE charge_requests SET status=? WHERE id=?", (status, request_id))
     db.commit()
 
 # ========== منطق الانضمام ==========
@@ -446,7 +494,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
         [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
         [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
-        [KeyboardButton("🎯 شحن نقاطك"), KeyboardButton("📁 مجلدات الروابط")]
+        [KeyboardButton("📁 مجلدات الروابط"), KeyboardButton("💳 شحن حسابي")]
     ]
 
     if has_multi_join_permission(user_id):
@@ -454,6 +502,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton("⏹️ إيقاف البوت"), KeyboardButton("▶️ تشغيل البوت")])
+        keyboard.append([KeyboardButton("▶️ تشغيل البوت لمستخدم"), KeyboardButton("⏹️ إيقاف البوت لمستخدم")])
         keyboard.append([KeyboardButton("👑 لوحة المطور"), KeyboardButton("🔋 شحن نقاط لمعلم")])
         keyboard.append([KeyboardButton("📢 إذاعة رسالة عامة")])
         keyboard.append([KeyboardButton("📂 سحب روابط المستخدمين"), KeyboardButton("🗑️ حذف أرشيف الروابط")])
@@ -462,7 +511,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     balance_display = "المشرف العام (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{balance} نقطة"
 
-    paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED else ""
+    paused_msg = " ⚠️ البوت متوقف حالياً (للمشرف فقط)" if BOT_PAUSED and not is_user_exempted(user_id) else ""
+    if BOT_PAUSED and is_user_exempted(user_id) and user_id != ADMIN_ID:
+        paused_msg = " ℹ️ البوت متوقف عام، لكن لديك استثناء وتستطيع استخدامه."
 
     await update.message.reply_text(
         f"🙋‍♂️ أهلاً بك يا {name} في بوت الانضمام التلقائي!{paused_msg}\n\n"
@@ -473,6 +524,161 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="Markdown"
     )
+
+# ========== معالجة شحن الحساب ==========
+async def handle_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_user_banned(user_id):
+        await update.message.reply_text("⛔ تم حظرك من استخدام هذا البوت.")
+        return
+
+    # عرض الباقات
+    keyboard = [
+        [InlineKeyboardButton("200 نقطة بـ 1000 ريال", callback_data="charge_200_1000")],
+        [InlineKeyboardButton("400 نقطة بـ 2000 ريال", callback_data="charge_400_2000")],
+        [InlineKeyboardButton("1000 نقطة بـ 4000 ريال", callback_data="charge_1000_4000")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="cancel_charge")]
+    ]
+    await update.message.reply_text(
+        "💳 **اختر الباقة المناسبة:**\n\n"
+        "• 200 نقطة بـ 1000 ريال\n"
+        "• 400 نقطة بـ 2000 ريال\n"
+        "• 1000 نقطة بـ 4000 ريال",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+# ========== معالجة اختيار الباقة ==========
+async def charge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data == "cancel_charge":
+        await query.edit_message_text("❌ تم إلغاء عملية الشحن.")
+        return
+
+    if data.startswith("charge_"):
+        parts = data.split("_")
+        points = int(parts[1])
+        price = int(parts[2])
+        package = f"{points} نقطة بـ {price} ريال"
+
+        # حفظ الباقة المختارة في حالة المستخدم
+        user_charge_state[user_id] = {
+            'package': package,
+            'points': points,
+            'price': price
+        }
+
+        # عرض بيانات الحساب مع أزرار
+        bank_text = (
+            "🏦 **بيانات الحساب البنكي:**\n\n"
+            "البنك: الكريمي\n"
+            "الاسم: محمد عبدة محمد غالب\n"
+            "رقم الحساب: `3097999111`\n\n"
+            "يرجى تحويل المبلغ على هذا الحساب، ثم اضغط على **تم التحويل** بعد إتمام الحوالة.\n"
+            "لإلغاء العملية اضغط **إلغاء التحويل**."
+        )
+        keyboard = [
+            [InlineKeyboardButton("✅ تم التحويل", callback_data="transfer_done")],
+            [InlineKeyboardButton("❌ إلغاء التحويل", callback_data="cancel_transfer")]
+        ]
+        await query.edit_message_text(
+            bank_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+# ========== معالجة "تم التحويل" ==========
+async def transfer_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    if user_id not in user_charge_state:
+        await query.edit_message_text("❌ لم يتم العثور على عملية شحن نشطة. ابدأ من جديد.")
+        return
+
+    # طلب إرسال الصورة
+    await query.edit_message_text(
+        "📸 **يرجى إرسال صورة إشعار الحوالة (لقطة شاشة) الآن.**\n"
+        "أرسل الصورة كـ **صورة (Photo)** وليس كملف.\n"
+        "سيتم حفظها وإرسالها للمشرف للمراجعة."
+    )
+    # تعيين حالة المستخدم لاستقبال الصورة
+    context.user_data['awaiting_charge_photo'] = True
+
+# ========== معالجة "إلغاء التحويل" ==========
+async def cancel_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    if user_id in user_charge_state:
+        del user_charge_state[user_id]
+    await query.edit_message_text("❌ تم إلغاء عملية التحويل.")
+
+# ========== معالجة صورة الحوالة ==========
+async def handle_charge_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.user_data.get('awaiting_charge_photo'):
+        return
+
+    if not update.message.photo:
+        await update.message.reply_text("❌ يرجى إرسال صورة (Photo) وليس ملفاً. أعد المحاولة.")
+        return
+
+    if user_id not in user_charge_state:
+        await update.message.reply_text("❌ لم يتم العثور على عملية شحن نشطة. ابدأ من جديد.")
+        context.user_data['awaiting_charge_photo'] = False
+        return
+
+    # حفظ الصورة في قاعدة البيانات
+    photo_file_id = update.message.photo[-1].file_id
+    charge_info = user_charge_state[user_id]
+    
+    # حفظ طلب الشحن
+    request_id = save_charge_request(
+        user_id,
+        charge_info['package'],
+        charge_info['points'],
+        charge_info['price'],
+        photo_file_id
+    )
+
+    # إرسال إشعار للمستخدم
+    await update.message.reply_text(
+        "✅ تم حفظ الصورة وسيتم إيداع الرصيد إلى حسابك بأقرب وقت.\n"
+        "نرجو الانتظار حتى يتم تأكيد الحوالة من قبل الإدارة."
+    )
+
+    # إرسال الصورة مع المعلومات للمشرف
+    caption = (
+        f"📥 **طلب شحن جديد**\n\n"
+        f"👤 المستخدم: `{user_id}`\n"
+        f"📦 الباقة: {charge_info['package']}\n"
+        f"💰 عدد النقاط: {charge_info['points']}\n"
+        f"💵 المبلغ: {charge_info['price']} ريال\n"
+        f"🆔 رقم الطلب: {request_id}\n\n"
+        f"الصورة المرفقة هي إشعار الحوالة."
+    )
+    try:
+        await context.bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=photo_file_id,
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"Failed to send photo to admin: {e}")
+        await update.message.reply_text("⚠️ حدث خطأ في إرسال الصورة للمشرف، لكن تم حفظها. سيتم مراجعتها قريباً.")
+
+    # تنظيف الحالة
+    if user_id in user_charge_state:
+        del user_charge_state[user_id]
+    context.user_data['awaiting_charge_photo'] = False
 
 # ========== معالجة الكولباك ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -490,6 +696,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
+    # معالجة الشحن
+    if data.startswith("charge_"):
+        await charge_callback(update, context)
+        return
+    if data == "transfer_done":
+        await transfer_done_callback(update, context)
+        return
+    if data == "cancel_transfer":
+        await cancel_transfer_callback(update, context)
+        return
+    if data == "cancel_charge":
+        await query.edit_message_text("❌ تم إلغاء عملية الشحن.")
+        return
+
+    # معالجة المجلدات
     if data.startswith("multi_join_folder_"):
         folder_id = int(data.split("_")[3])
         cursor.execute("SELECT folder_name FROM folders WHERE id=? AND user_id=?", (folder_id, user_id))
@@ -850,7 +1071,6 @@ async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_T
     
     reply = "📂 **إحصائيات المستخدمين والروابط:**\n\n"
     for uid, count in data:
-        # نرسل الأيدي بصيغة نصية قابلة للنسخ (باستخدام علامات التنسيق)
         reply += f"• المستخدم: `{uid}` → عدد الروابط: ({count})\n"
     
     reply += "\n👇 أرسل معرف المستخدم (User ID) الذي تريد سحب روابطه.\n"
@@ -862,7 +1082,6 @@ async def fetch_user_links_admin(update: Update, context: ContextTypes.DEFAULT_T
 # ========== معالجة سحب روابط المستخدم (بعد إرسال المعرف) - تسحب جميع الروابط بدون حد ==========
 async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_TYPE, target_uid):
     try:
-        # جلب جميع روابط المستخدم بجميع حالاتها (لا يوجد حد)
         cursor.execute("""
             SELECT link, status, folder_id 
             FROM links 
@@ -875,7 +1094,6 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text(f"⚠️ لا توجد أي روابط مسجلة للمستخدم `{target_uid}`", parse_mode="Markdown")
             return
         
-        # تجميع الروابط حسب المجلد
         folders = {}
         for link, status, folder_id in user_links:
             if folder_id not in folders:
@@ -891,13 +1109,12 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
         msg = f"📂 **روابط المستخدم `{target_uid}`**\n"
         msg += f"📊 **إجمالي الروابط:** {total_links}\n\n"
         
-        # بناء الرسائل في أجزاء بحيث لا تتجاوز 4000 حرف
         parts = [msg]
         current_part = msg
         
         for folder_id, folder_data in folders.items():
             folder_header = f"📁 **{folder_data['name']}**\n"
-            if len(current_part) + len(folder_header) + 100 > 4000:  # 100 للاحتياط
+            if len(current_part) + len(folder_header) + 100 > 4000:
                 parts.append(current_part)
                 current_part = folder_header
             else:
@@ -914,22 +1131,17 @@ async def handle_fetch_user_links(update: Update, context: ContextTypes.DEFAULT_
                 else:
                     current_part += line
             
-            current_part += "\n"  # سطر فارغ بين المجلدات
+            current_part += "\n"
         
-        # إضافة الجزء الأخير إذا لم يكن فارغاً
         if current_part and current_part not in parts:
             parts.append(current_part)
         
-        # إرسال جميع الأجزاء
         for i, part in enumerate(parts):
             if i == 0:
-                # الجزء الأول يحتوي على العنوان، نرسله كما هو
                 await update.message.reply_text(part, parse_mode="Markdown", disable_web_page_preview=False)
             else:
-                # الأجزاء التالية نضيف لها تذييل بسيط
                 await update.message.reply_text(part, parse_mode="Markdown", disable_web_page_preview=False)
             
-            # تأخير بسيط بين الرسائل لتجنب الإغراق
             await asyncio.sleep(0.2)
             
     except Exception as e:
@@ -946,18 +1158,23 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ تم حظرك من استخدام هذا البوت.")
         return
 
-    text = update.message.text.strip()
-    action = context.user_data.get('action')
-
-    if BOT_PAUSED and user_id != ADMIN_ID:
+    if BOT_PAUSED and not is_user_exempted(user_id):
         await update.message.reply_text("⛔ البوت متوقف حالياً، يرجى التواصل مع المشرف.")
         return
+
+    text = update.message.text.strip()
+    action = context.user_data.get('action')
 
     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
     db.commit()
 
     if text == "/start":
         return await start(update, context)
+
+    # ========== زر شحن حسابي ==========
+    if text == "💳 شحن حسابي":
+        await handle_charge(update, context)
+        return
 
     # ========== أزرار المشرف ==========
     if text == "⏹️ إيقاف البوت" and user_id == ADMIN_ID:
@@ -968,6 +1185,16 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "▶️ تشغيل البوت" and user_id == ADMIN_ID:
         BOT_PAUSED = False
         await update.message.reply_text("✅ تم تشغيل البوت. جميع المستخدمين يمكنهم استخدام البوت الآن.")
+        return
+
+    if text == "▶️ تشغيل البوت لمستخدم" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل معرف المستخدم (User ID) الذي تريد تشغيل البوت له (استثناء من التوقف العام):")
+        context.user_data['action'] = 'admin_exempt_user'
+        return
+
+    if text == "⏹️ إيقاف البوت لمستخدم" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل معرف المستخدم (User ID) الذي تريد إلغاء استثناء التوقف له (يعود للتوقف العام):")
+        context.user_data['action'] = 'admin_remove_exempt'
         return
 
     if text == "🔀 انضمام متعدد" and has_multi_join_permission(user_id):
@@ -1005,17 +1232,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['action'] = 'admin_unban_user'
         return
 
-    # ========== زر سحب روابط المستخدمين ==========
     if text == "📂 سحب روابط المستخدمين" and user_id == ADMIN_ID:
         await fetch_user_links_admin(update, context)
-        return
-
-    # ========== زر شحن النقاط ==========
-    if text == "🎯 شحن نقاطك":
-        await update.message.reply_text(
-            f"لشحن نقاطك يرجى التواصل على @Ra11_8h\n\nمعرفك: `{user_id}`",
-            parse_mode="Markdown"
-        )
         return
 
     # ========== بقية الأزرار ==========
@@ -1129,6 +1347,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 pause_status = "⏳ توقف مؤقت (غير محدد)"
 
+        exempt_status = "نعم" if is_user_exempted(user_id) else "لا"
+
         await update.message.reply_text(
             f"📋 **حالة النظام**\n\n"
             f"• الحالة: {is_running}\n"
@@ -1136,6 +1356,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• عدد الحسابات المسجلة: {total_accounts}\n"
             f"• صلاحية الانضمام المتعدد: {multi_perm}\n"
             f"• التوقف الجماعي: {pause_status}\n"
+            f"• مستثنى من التوقف العام: {exempt_status}\n"
             f"• الوقت بين الروابط: {delay} ثانية\n"
             f"• استراحة كل 5 روابط: {rest} دقائق\n"
             f"• المجلد المختار: {folder_name}\n"
@@ -1211,17 +1432,18 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("SELECT COUNT(*) FROM accounts")
         total_accounts = cursor.fetchone()[0]
         cursor.execute("""
-            SELECT users.user_id, users.balance, users.multi_join_permission, users.is_banned, COUNT(accounts.id) 
+            SELECT users.user_id, users.balance, users.multi_join_permission, users.is_banned, users.is_exempted, COUNT(accounts.id) 
             FROM users 
             LEFT JOIN accounts ON users.user_id = accounts.user_id 
             GROUP BY users.user_id
         """)
         details = cursor.fetchall()
         admin_reply = f"👑 **لوحة المطور**\n👥 المستخدمين: {total_users}\n📱 الأرقام: {total_accounts}\n\n"
-        for u_id, bal, perm, banned, count in details:
+        for u_id, bal, perm, banned, exempt, count in details:
             perm_str = "✅" if perm == 1 else "❌"
             banned_str = "🚫" if banned == 1 else "✔️"
-            admin_reply += f"• المستخدم `{u_id}`: نقاط {bal} | أرقام {count} | متعدد {perm_str} | محظور {banned_str}\n"
+            exempt_str = "🔓" if exempt == 1 else "🔒"
+            admin_reply += f"• المستخدم `{u_id}`: نقاط {bal} | أرقام {count} | متعدد {perm_str} | محظور {banned_str} | مستثنى {exempt_str}\n"
         await update.message.reply_text(admin_reply, parse_mode="Markdown")
         return
 
@@ -1274,6 +1496,36 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ تم تحديث وقت الاستراحة إلى: {new_rest} دقائق.")
         except ValueError:
             await update.message.reply_text("❌ يرجى إرسال رقم صحيح (0 أو أكثر).")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة استثناء التوقف ==========
+    if action == 'admin_exempt_user' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,))
+            set_user_exempted(target, True)
+            await update.message.reply_text(f"✅ تم تشغيل البوت للمستخدم `{target}` (مستثنى من التوقف العام).")
+            try:
+                await context.bot.send_message(chat_id=target, text="✅ تم تفعيل البوت لك رغم التوقف العام، يمكنك استخدامه الآن.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    if action == 'admin_remove_exempt' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            set_user_exempted(target, False)
+            await update.message.reply_text(f"✅ تم إلغاء استثناء المستخدم `{target}` (سيتوقف البوت لديه عند التوقف العام).")
+            try:
+                await context.bot.send_message(chat_id=target, text="⚠️ تم إلغاء استثناء التوقف عن البوت، سيتوقف لديك عند إيقاف البوت العام.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
         context.user_data.clear()
         return
 
@@ -1382,7 +1634,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['action'] = 'admin_charge_amount'
         except ValueError:
             await update.message.reply_text("❌ معرف غير صحيح.")
-            context.user_data.clear()
+        context.user_data.clear()
         return
 
     if action == 'admin_charge_amount' and user_id == ADMIN_ID:
@@ -1471,11 +1723,18 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⚠️ زر غير معروف أو حدث خطأ، يرجى استخدام الأزرار المتاحة.")
 
+# ========== معالجة الصور (لشحن الحساب) ==========
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if context.user_data.get('awaiting_charge_photo'):
+        await handle_charge_photo(update, context)
+
 # ========== تشغيل البوت ==========
 if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع ميزة سحب الروابط الكاملة والأيدي القابلة للنسخ...")
+    print("🚀 البوت يعمل مع نظام الشحن الجديد...")
     app.run_polling()
