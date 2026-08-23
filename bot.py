@@ -15,7 +15,6 @@ API_HASH = "a5dcef068387dd95705046f910d6cd48"
 
 ADMIN_ID = 5064913080
 
-# متغير عام للتحكم في إيقاف البوت (للمشرف فقط)
 BOT_PAUSED = False
 
 logging.basicConfig(level=logging.INFO)
@@ -62,7 +61,6 @@ CREATE TABLE IF NOT EXISTS links (
     FOREIGN KEY(folder_id) REFERENCES folders(id)
 )
 """)
-# جدول لتخزين آخر رابط تمت معالجته في الانضمام المتعدد
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS multi_join_progress (
     user_id INTEGER,
@@ -72,7 +70,6 @@ CREATE TABLE IF NOT EXISTS multi_join_progress (
     PRIMARY KEY (user_id, account_id, folder_id)
 )
 """)
-# جدول طلبات الشحن
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS charge_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,7 +77,7 @@ CREATE TABLE IF NOT EXISTS charge_requests (
     package TEXT,
     amount INTEGER,
     price INTEGER,
-    status TEXT DEFAULT 'pending',  -- pending, completed, cancelled
+    status TEXT DEFAULT 'pending',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     photo_file_id TEXT
 )
@@ -112,8 +109,7 @@ except sqlite3.OperationalError:
 running_states = {}
 multi_running_states = {}
 global_pause = {}
-# متغير لتتبع حالة شحن المستخدم (حفظ الباقة المختارة)
-user_charge_state = {}  # user_id -> {'package': str, 'points': int, 'price': int}
+user_charge_state = {}
 
 PAUSE_DURATION_SECONDS = 300
 
@@ -219,6 +215,14 @@ def save_charge_request(user_id, package, points, price, photo_file_id=None):
 
 def update_charge_request_status(request_id, status):
     cursor.execute("UPDATE charge_requests SET status=? WHERE id=?", (status, request_id))
+    db.commit()
+
+def get_charge_request(request_id):
+    cursor.execute("SELECT user_id, amount FROM charge_requests WHERE id=?", (request_id,))
+    return cursor.fetchone()
+
+def add_balance(user_id, amount):
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
     db.commit()
 
 # ========== منطق الانضمام ==========
@@ -532,7 +536,6 @@ async def handle_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ تم حظرك من استخدام هذا البوت.")
         return
 
-    # عرض الباقات
     keyboard = [
         [InlineKeyboardButton("200 نقطة بـ 1000 ريال", callback_data="charge_200_1000")],
         [InlineKeyboardButton("400 نقطة بـ 2000 ريال", callback_data="charge_400_2000")],
@@ -565,14 +568,12 @@ async def charge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = int(parts[2])
         package = f"{points} نقطة بـ {price} ريال"
 
-        # حفظ الباقة المختارة في حالة المستخدم
         user_charge_state[user_id] = {
             'package': package,
             'points': points,
             'price': price
         }
 
-        # عرض بيانات الحساب مع أزرار
         bank_text = (
             "🏦 **بيانات الحساب البنكي:**\n\n"
             "البنك: الكريمي\n"
@@ -601,13 +602,11 @@ async def transfer_done_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ لم يتم العثور على عملية شحن نشطة. ابدأ من جديد.")
         return
 
-    # طلب إرسال الصورة
     await query.edit_message_text(
         "📸 **يرجى إرسال صورة إشعار الحوالة (لقطة شاشة) الآن.**\n"
         "أرسل الصورة كـ **صورة (Photo)** وليس كملف.\n"
         "سيتم حفظها وإرسالها للمشرف للمراجعة."
     )
-    # تعيين حالة المستخدم لاستقبال الصورة
     context.user_data['awaiting_charge_photo'] = True
 
 # ========== معالجة "إلغاء التحويل" ==========
@@ -635,11 +634,9 @@ async def handle_charge_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['awaiting_charge_photo'] = False
         return
 
-    # حفظ الصورة في قاعدة البيانات
     photo_file_id = update.message.photo[-1].file_id
     charge_info = user_charge_state[user_id]
     
-    # حفظ طلب الشحن
     request_id = save_charge_request(
         user_id,
         charge_info['package'],
@@ -648,13 +645,12 @@ async def handle_charge_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         photo_file_id
     )
 
-    # إرسال إشعار للمستخدم
     await update.message.reply_text(
         "✅ تم حفظ الصورة وسيتم إيداع الرصيد إلى حسابك بأقرب وقت.\n"
         "نرجو الانتظار حتى يتم تأكيد الحوالة من قبل الإدارة."
     )
 
-    # إرسال الصورة مع المعلومات للمشرف
+    # إرسال الصورة مع معلومات وأزرار قبول/رفض للمشرف
     caption = (
         f"📥 **طلب شحن جديد**\n\n"
         f"👤 المستخدم: `{user_id}`\n"
@@ -662,23 +658,69 @@ async def handle_charge_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"💰 عدد النقاط: {charge_info['points']}\n"
         f"💵 المبلغ: {charge_info['price']} ريال\n"
         f"🆔 رقم الطلب: {request_id}\n\n"
-        f"الصورة المرفقة هي إشعار الحوالة."
+        f"يرجى مراجعة الصورة واتخاذ القرار."
     )
+    keyboard = [
+        [InlineKeyboardButton("✅ قبول", callback_data=f"approve_charge_{request_id}")],
+        [InlineKeyboardButton("❌ رفض", callback_data=f"reject_charge_{request_id}")]
+    ]
     try:
         await context.bot.send_photo(
             chat_id=ADMIN_ID,
             photo=photo_file_id,
             caption=caption,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
     except Exception as e:
         logging.error(f"Failed to send photo to admin: {e}")
         await update.message.reply_text("⚠️ حدث خطأ في إرسال الصورة للمشرف، لكن تم حفظها. سيتم مراجعتها قريباً.")
 
-    # تنظيف الحالة
     if user_id in user_charge_state:
         del user_charge_state[user_id]
     context.user_data['awaiting_charge_photo'] = False
+
+# ========== معالجة قبول/رفض طلب الشحن من المشرف ==========
+async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    admin_id = update.effective_user.id
+
+    if admin_id != ADMIN_ID:
+        await query.edit_message_text("⛔ هذه الخاصية للمشرف فقط.")
+        return
+
+    if data.startswith("approve_charge_"):
+        request_id = int(data.split("_")[2])
+        charge_data = get_charge_request(request_id)
+        if not charge_data:
+            await query.edit_message_text("❌ الطلب غير موجود.")
+            return
+        user_id, amount = charge_data
+        # إضافة النقاط
+        add_balance(user_id, amount)
+        update_charge_request_status(request_id, 'completed')
+        await query.edit_message_text(f"✅ تم قبول الطلب رقم {request_id} وإضافة {amount} نقطة للمستخدم `{user_id}`.")
+        # إشعار المستخدم
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"🎉 تم قبول طلب الشحن الخاص بك وإضافة {amount} نقطة إلى رصيدك.")
+        except:
+            pass
+
+    elif data.startswith("reject_charge_"):
+        request_id = int(data.split("_")[2])
+        charge_data = get_charge_request(request_id)
+        if not charge_data:
+            await query.edit_message_text("❌ الطلب غير موجود.")
+            return
+        user_id, _ = charge_data
+        update_charge_request_status(request_id, 'rejected')
+        await query.edit_message_text(f"❌ تم رفض الطلب رقم {request_id}.")
+        try:
+            await context.bot.send_message(chat_id=user_id, text="❌ تم رفض طلب الشحن الخاص بك. يرجى التواصل مع الإدارة.")
+        except:
+            pass
 
 # ========== معالجة الكولباك ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -691,13 +733,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⛔ تم حظرك من استخدام هذا البوت.")
         return
 
-    if data == "cancel":
-        await query.edit_message_text("❌ تم الإلغاء.")
-        context.user_data.clear()
+    # معالجة قرارات الشحن من المشرف
+    if data.startswith("approve_charge_") or data.startswith("reject_charge_"):
+        await admin_charge_decision(update, context)
         return
 
-    # معالجة الشحن
-    if data.startswith("charge_"):
+    # معالجة الشحن للمستخدمين
+    if data.startswith("charge_") or data == "cancel_charge":
         await charge_callback(update, context)
         return
     if data == "transfer_done":
@@ -706,8 +748,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cancel_transfer":
         await cancel_transfer_callback(update, context)
         return
-    if data == "cancel_charge":
-        await query.edit_message_text("❌ تم إلغاء عملية الشحن.")
+
+    if data == "cancel":
+        await query.edit_message_text("❌ تم الإلغاء.")
+        context.user_data.clear()
         return
 
     # معالجة المجلدات
@@ -1236,6 +1280,12 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fetch_user_links_admin(update, context)
         return
 
+    # ========== معالجة زر شحن نقاط لمعلم ==========
+    if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
+        await update.message.reply_text("أرسل معرف المستخدم الذي تريد شحن نقاطه:")
+        context.user_data['action'] = 'admin_charge_id'
+        return
+
     # ========== بقية الأزرار ==========
     if text == "📁 مجلدات الروابط":
         folders = get_user_folders(user_id)
@@ -1447,11 +1497,42 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(admin_reply, parse_mode="Markdown")
         return
 
-    if text == "🔋 شحن نقاط لمعلم" and user_id == ADMIN_ID:
-        await update.message.reply_text("أرسل معرف المستخدم:")
-        context.user_data['action'] = 'admin_charge_id'
+    # ========== معالجة شحن النقاط للمعلم (بعد إرسال الرقم والعدد) ==========
+    if action == 'admin_charge_id' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            context.user_data['target_charge_id'] = target
+            await update.message.reply_text(f"🔋 المستهدف: `{target}`\nأرسل عدد النقاط:")
+            context.user_data['action'] = 'admin_charge_amount'
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+            context.user_data.clear()
         return
 
+    if action == 'admin_charge_amount' and user_id == ADMIN_ID:
+        try:
+            amount = int(text)
+            target = context.user_data.get('target_charge_id')
+            if target is None:
+                await update.message.reply_text("❌ حدث خطأ، حاول مجدداً.")
+                context.user_data.clear()
+                return
+            cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (target,))
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target))
+            db.commit()
+            cursor.execute("SELECT balance FROM users WHERE user_id=?", (target,))
+            new_bal = cursor.fetchone()[0]
+            await update.message.reply_text(f"✅ تم إضافة {amount} نقطة للمستخدم `{target}`\nرصيده الآن: {new_bal}")
+            try:
+                await context.bot.send_message(chat_id=target, text=f"🎉 تم شحن {amount} نقطة، رصيدك الآن: {new_bal}")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ أرسل عدد صحيح.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة بقية أوامر المشرف ==========
     if text == "📢 إذاعة رسالة عامة" and user_id == ADMIN_ID:
         await update.message.reply_text("أرسل الرسالة للإذاعة (أو /cancel):")
         context.user_data['action'] = 'admin_broadcast'
@@ -1625,37 +1706,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ تم الإرسال: {success} نجاح، {fail} فشل.")
         return
 
-    # ========== معالجة شحن النقاط من المشرف ==========
-    if action == 'admin_charge_id' and user_id == ADMIN_ID:
-        try:
-            target = int(text)
-            context.user_data['target_charge_id'] = target
-            await update.message.reply_text(f"🔋 المستهدف: `{target}`\nأرسل عدد النقاط:")
-            context.user_data['action'] = 'admin_charge_amount'
-        except ValueError:
-            await update.message.reply_text("❌ معرف غير صحيح.")
-        context.user_data.clear()
-        return
-
-    if action == 'admin_charge_amount' and user_id == ADMIN_ID:
-        try:
-            amount = int(text)
-            target = context.user_data.get('target_charge_id')
-            cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (target,))
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, target))
-            db.commit()
-            cursor.execute("SELECT balance FROM users WHERE user_id=?", (target,))
-            new_bal = cursor.fetchone()[0]
-            await update.message.reply_text(f"✅ تم إضافة {amount} نقطة للمستخدم `{target}`\nرصيده الآن: {new_bal}")
-            try:
-                await context.bot.send_message(chat_id=target, text=f"🎉 تم شحن {amount} نقطة، رصيدك الآن: {new_bal}")
-            except:
-                pass
-        except ValueError:
-            await update.message.reply_text("❌ أرسل عدد صحيح.")
-        context.user_data.clear()
-        return
-
     # ========== معالجة تسجيل الدخول ==========
     if action == 'login_phone':
         context.user_data['temp_phone'] = text
@@ -1736,5 +1786,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع نظام الشحن الجديد...")
+    print("🚀 البوت يعمل مع نظام الشحن الجديد (قبول/رفض) وشحن النقاط للمعلم...")
     app.run_polling()
