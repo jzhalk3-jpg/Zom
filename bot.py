@@ -680,7 +680,7 @@ async def handle_charge_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         del user_charge_state[user_id]
     context.user_data['awaiting_charge_photo'] = False
 
-# ========== معالجة قبول/رفض طلب الشحن من المشرف ==========
+# ========== معالجة قبول/رفض طلب الشحن من المشرف (معدلة) ==========
 async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -698,15 +698,34 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ الطلب غير موجود.")
             return
         user_id, amount = charge_data
+        
         # إضافة النقاط
         add_balance(user_id, amount)
         update_charge_request_status(request_id, 'completed')
-        await query.edit_message_text(f"✅ تم قبول الطلب رقم {request_id} وإضافة {amount} نقطة للمستخدم `{user_id}`.")
+        
+        # تعديل الرسالة الأصلية للمشرف (تحديث النص وإزالة الأزرار)
+        new_caption = (
+            f"✅ **تم قبول طلب الشحن**\n\n"
+            f"👤 المستخدم: `{user_id}`\n"
+            f"💰 عدد النقاط: {amount}\n"
+            f"🆔 رقم الطلب: {request_id}\n\n"
+            f"تمت إضافة النقاط بنجاح."
+        )
+        await query.edit_message_caption(
+            caption=new_caption,
+            parse_mode="Markdown"
+        )
+        # إزالة الأزرار (تحديث بدون reply_markup)
+        await query.edit_message_reply_markup(reply_markup=None)
+        
         # إشعار المستخدم
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"🎉 تم قبول طلب الشحن الخاص بك وإضافة {amount} نقطة إلى رصيدك.")
-        except:
-            pass
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🎉 تم شحن رصيدك بنجاح!\nتم إضافة {amount} نقطة إلى حسابك."
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify user {user_id}: {e}")
 
     elif data.startswith("reject_charge_"):
         request_id = int(data.split("_")[2])
@@ -716,11 +735,28 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
             return
         user_id, _ = charge_data
         update_charge_request_status(request_id, 'rejected')
-        await query.edit_message_text(f"❌ تم رفض الطلب رقم {request_id}.")
+        
+        # تعديل الرسالة الأصلية للمشرف
+        new_caption = (
+            f"❌ **تم رفض طلب الشحن**\n\n"
+            f"👤 المستخدم: `{user_id}`\n"
+            f"🆔 رقم الطلب: {request_id}\n\n"
+            f"تم رفض الطلب."
+        )
+        await query.edit_message_caption(
+            caption=new_caption,
+            parse_mode="Markdown"
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        
+        # إشعار المستخدم
         try:
-            await context.bot.send_message(chat_id=user_id, text="❌ تم رفض طلب الشحن الخاص بك. يرجى التواصل مع الإدارة.")
-        except:
-            pass
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ لم يتم الشحن بنجاح. يرجى التواصل مع الإدارة."
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify user {user_id}: {e}")
 
 # ========== معالجة الكولباك ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
