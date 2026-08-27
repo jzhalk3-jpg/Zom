@@ -82,7 +82,6 @@ CREATE TABLE IF NOT EXISTS charge_requests (
     photo_file_id TEXT
 )
 """)
-# جدول الباقات
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS packages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,7 +211,7 @@ def set_user_exempted(user_id, value):
     cursor.execute("UPDATE users SET is_exempted=? WHERE user_id=?", (1 if value else 0, user_id))
     db.commit()
 
-# ========== دوال الشحن ==========
+# ========== دوال الشحن والرصيد ==========
 def save_charge_request(user_id, package, points, price, photo_file_id=None):
     cursor.execute("""
         INSERT INTO charge_requests (user_id, package, amount, price, photo_file_id)
@@ -455,16 +454,22 @@ async def multi_join_task(user_id, context, account_data, folder_id, folder_name
             # تحديث حالة الرابط في قاعدة البيانات
             if status == "SUCCESS":
                 local_cursor.execute("UPDATE links SET status='completed' WHERE id=?", (lid,))
-                success_count += 1
-            elif status == "FAILED":
+                # تحديد نوع النجاح لعرض الرسالة المناسبة
+                if "عضو" in msg or "already" in msg:
+                    already_count += 1
+                    result_msg = "🟢 المجموعة مضاف فيها من قبل"
+                elif "طلب" in msg or "مرسل" in msg:
+                    already_count += 1
+                    result_msg = "⏳ تم طلب الانضمام من قبل"
+                else:
+                    success_count += 1
+                    result_msg = msg
+            else:
                 local_cursor.execute("UPDATE links SET status='failed' WHERE id=?", (lid,))
                 fail_count += 1
-            else:
-                # حالات مثل "🟢 أنت عضو بالفعل" أو "⏳ طلب انضمام مرسل" نعتبرها نجاح
-                local_cursor.execute("UPDATE links SET status='completed' WHERE id=?", (lid,))
-                already_count += 1
+                result_msg = msg
 
-            if user_id != ADMIN_ID and status == "SUCCESS":
+            if user_id != ADMIN_ID and status == "SUCCESS" and ("عضو" not in msg and "طلب" not in msg):
                 local_cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (user_id,))
             local_db.commit()
 
@@ -474,15 +479,6 @@ async def multi_join_task(user_id, context, account_data, folder_id, folder_name
 
             # إرسال رسالة النتيجة مع رابط قابل للفتح
             formatted_link = f"[{link}](https://t.me/{link})" if not link.startswith("http") else link
-            if status == "SUCCESS":
-                result_msg = msg
-            elif "member" in msg or "عضو" in msg:
-                result_msg = "🟢 الرابط منضم له من قبل"
-            elif "طلب" in msg or "مرسل" in msg:
-                result_msg = "⏳ تم طلب الانضمام من قبل"
-            else:
-                result_msg = msg
-
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"📱 {phone} ({idx}/{len(links)}): {formatted_link}\nالنتيجة: {result_msg}",
@@ -554,9 +550,18 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
 
                 if status == "SUCCESS":
                     local_cursor.execute("UPDATE links SET status='completed' WHERE id=?", (lid,))
+                    # تحديد الرسالة المناسبة
+                    if "عضو" in msg or "already" in msg:
+                        result_msg = "🟢 المجموعة مضاف فيها من قبل"
+                    elif "طلب" in msg or "مرسل" in msg:
+                        result_msg = "⏳ تم طلب الانضمام من قبل"
+                    else:
+                        result_msg = msg
                 else:
                     local_cursor.execute("UPDATE links SET status='failed' WHERE id=?", (lid,))
-                if user_id != ADMIN_ID and status == "SUCCESS":
+                    result_msg = msg
+
+                if user_id != ADMIN_ID and status == "SUCCESS" and ("عضو" not in msg and "طلب" not in msg):
                     local_cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (user_id,))
                 local_db.commit()
 
@@ -567,13 +572,6 @@ async def background_join_task(user_id, context, active_acc, delay_time, rest_ti
                 bal_str = "المشرف (نقاط مفتوحة)" if user_id == ADMIN_ID else f"{rem_bal} نقطة"
 
                 formatted_link = f"[{link}](https://t.me/{link})" if not link.startswith("http") else link
-                if "member" in msg or "عضو" in msg:
-                    result_msg = "🟢 الرابط منضم له من قبل"
-                elif "طلب" in msg or "مرسل" in msg:
-                    result_msg = "⏳ تم طلب الانضمام من قبل"
-                else:
-                    result_msg = msg
-
                 await context.bot.send_message(
                     chat_id=user_id,
                     text=f"📱 الرقم: {active_acc[1]}\n🔗 الرابط: {formatted_link}\nالنتيجة: {result_msg}\n🎯 نقاطك: {bal_str}",
@@ -805,7 +803,7 @@ async def stop_multi_joining(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop('multi_tasks', None)
     await update.message.reply_text("🛑 تم إيقاف جميع عمليات الانضمام المتعدد.")
 
-# ========== دوال الشحن ==========
+# ========== دوال الشحن والإدارة ==========
 async def handle_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_user_banned(user_id):
@@ -975,6 +973,7 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
             return
         user_id, amount = charge_data
         
+        # إضافة النقاط
         add_balance(user_id, amount)
         update_charge_request_status(request_id, 'completed')
         
@@ -991,6 +990,7 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await query.edit_message_reply_markup(reply_markup=None)
         
+        # إرسال إشعار للمستخدم
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -1028,7 +1028,7 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logging.error(f"Failed to notify user {user_id}: {e}")
 
-# ========== دوال إدارة الباقات ==========
+# ========== إدارة الباقات ==========
 async def manage_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
