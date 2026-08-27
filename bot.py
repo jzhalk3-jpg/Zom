@@ -90,17 +90,6 @@ CREATE TABLE IF NOT EXISTS packages (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
-# جدول لتخزين حالة التسجيل المتعدد
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS multi_register_state (
-    user_id INTEGER PRIMARY KEY,
-    phones TEXT,
-    code_hashes TEXT,
-    clients TEXT,
-    step TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
 db.commit()
 
 # ترقية الجداول القديمة
@@ -256,29 +245,7 @@ def delete_package(package_id):
     cursor.execute("DELETE FROM packages WHERE id=?", (package_id,))
     db.commit()
 
-# ========== دوال التسجيل المتعدد ==========
-def save_multi_register_state(user_id, phones, code_hashes, clients, step):
-    import json
-    # نحتاج لتخزين القوائم كـ JSON
-    cursor.execute("""
-        INSERT OR REPLACE INTO multi_register_state (user_id, phones, code_hashes, clients, step)
-        VALUES (?, ?, ?, ?, ?)
-    """, (user_id, json.dumps(phones), json.dumps(code_hashes), json.dumps(clients), step))
-    db.commit()
-
-def get_multi_register_state(user_id):
-    import json
-    cursor.execute("SELECT phones, code_hashes, clients, step FROM multi_register_state WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-    if row:
-        return json.loads(row[0]), json.loads(row[1]), json.loads(row[2]), row[3]
-    return None, None, None, None
-
-def delete_multi_register_state(user_id):
-    cursor.execute("DELETE FROM multi_register_state WHERE user_id=?", (user_id,))
-    db.commit()
-
-# ========== منطق الانضمام (مع التوقف 5 دقائق) ==========
+# ========== منطق الانضمام ==========
 async def join_logic_with_global_pause(session_str, link, user_id, account_index, context):
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
@@ -608,7 +575,6 @@ async def multi_join_task(user_id, context, account_data, folder_id, folder_name
         logging.error(f"Error in multi_join_task for {phone}: {e}")
         await context.bot.send_message(chat_id=user_id, text=f"❌ حدث خطأ في الرقم {phone}: {str(e)[:100]}")
 
-# ========== دوال تشغيل الانضمام ==========
 async def start_joining(update, context, user_id, folder_id, folder_name):
     links = get_folder_links(folder_id)
     if not links:
@@ -810,206 +776,6 @@ async def stop_multi_joining(update: Update, context: ContextTypes.DEFAULT_TYPE)
     multi_running_states.pop(user_id, None)
     context.user_data.pop('multi_tasks', None)
     await update.message.reply_text("🛑 تم إيقاف جميع عمليات الانضمام المتعدد.")
-
-# ========== دوال التسجيل المتعدد ==========
-async def handle_multi_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if is_user_banned(user_id):
-        await update.message.reply_text("⛔ تم حظرك من استخدام هذا البوت.")
-        return
-
-    # إنشاء رسالة تحتوي على 10 فراغات مرقمة
-    template = "📱 **تسجيل أرقام متعددة**\n\n"
-    template += "أدخل الأرقام في الفراغات التالية (مع رمز الدولة):\n\n"
-    for i in range(1, 11):
-        template += f"{i}. [أدخل الرقم هنا]\n"
-    
-    template += "\n📌 مثال: +966500000001\n"
-    template += "يمكنك إدخال أقل من 10 أرقام، اترك الفراغات الفارغة."
-
-    keyboard = [
-        [KeyboardButton("📨 طلب الكود"), KeyboardButton("❌ إلغاء")]
-    ]
-    await update.message.reply_text(
-        template,
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    context.user_data['multi_register_step'] = 'waiting_phones'
-
-# ========== معالجة إدخال الأرقام ==========
-async def handle_multi_register_phones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if text == "❌ إلغاء":
-        context.user_data.pop('multi_register_step', None)
-        await update.message.reply_text("❌ تم إلغاء عملية التسجيل المتعدد.")
-        return
-
-    if text == "📨 طلب الكود":
-        # التحقق من وجود أرقام
-        phones = context.user_data.get('temp_phones', [])
-        if not phones:
-            await update.message.reply_text("⚠️ لم تقم بإدخال أي أرقام. أرسل الأرقام أولاً.")
-            return
-        
-        # إرسال طلب كود لكل رقم
-        await update.message.reply_text(f"⏳ جاري إرسال طلب كود التحقق إلى {len(phones)} رقم...")
-        
-        code_hashes = []
-        clients = []
-        valid_phones = []
-        
-        for i, phone in enumerate(phones):
-            try:
-                client = TelegramClient(StringSession(), API_ID, API_HASH)
-                await client.connect()
-                send_code = await client.send_code_request(phone)
-                code_hashes.append(send_code.phone_code_hash)
-                clients.append(client)
-                valid_phones.append(phone)
-                await update.message.reply_text(f"✅ تم إرسال الكود إلى الرقم {i+1}: {phone}")
-                await asyncio.sleep(1)  # تأخير بسيط لتجنب الحظر
-            except Exception as e:
-                await update.message.reply_text(f"❌ فشل إرسال الكود إلى {phone}: {str(e)}")
-        
-        if not valid_phones:
-            await update.message.reply_text("❌ لم يتم إرسال أي كود. تأكد من الأرقام وحاول مرة أخرى.")
-            return
-        
-        # حفظ حالة التسجيل
-        save_multi_register_state(user_id, valid_phones, code_hashes, clients, 'waiting_codes')
-        
-        # إنشاء رسالة الأكواد
-        codes_template = "🔑 **أدخل أكواد التحقق**\n\n"
-        for i, phone in enumerate(valid_phones):
-            codes_template += f"{i+1}. {phone} → [أدخل الكود]\n"
-        
-        codes_template += "\n📌 أدخل الأكواد بنفس الترتيب، كل كود في سطر منفصل."
-        
-        keyboard = [
-            [KeyboardButton("✅ إرسال الأكواد"), KeyboardButton("❌ إلغاء")]
-        ]
-        await update.message.reply_text(
-            codes_template,
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
-            parse_mode="Markdown"
-        )
-        context.user_data['multi_register_step'] = 'waiting_codes'
-        return
-
-    # معالجة الأرقام المدخلة
-    lines = text.split('\n')
-    phones = []
-    for line in lines:
-        # استخراج الرقم (تجاهل الأرقام التسلسلية)
-        parts = line.split('.')
-        if len(parts) > 1:
-            phone = parts[1].strip()
-        else:
-            phone = line.strip()
-        
-        if phone and phone != "[أدخل الرقم هنا]" and phone.startswith('+'):
-            phones.append(phone)
-    
-    if not phones:
-        await update.message.reply_text("⚠️ لم يتم التعرف على أي أرقام صالحة. تأكد من كتابتها مع رمز الدولة (+).")
-        return
-    
-    context.user_data['temp_phones'] = phones
-    await update.message.reply_text(f"✅ تم استلام {len(phones)} رقم.\nاضغط على زر '📨 طلب الكود' لإرسال طلبات التحقق.")
-
-# ========== معالجة إدخال الأكواد ==========
-async def handle_multi_register_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if text == "❌ إلغاء":
-        delete_multi_register_state(user_id)
-        context.user_data.pop('multi_register_step', None)
-        await update.message.reply_text("❌ تم إلغاء عملية التسجيل المتعدد.")
-        return
-
-    if text == "✅ إرسال الأكواد":
-        # جلب حالة التسجيل
-        phones, code_hashes, clients_str, step = get_multi_register_state(user_id)
-        if not phones or not code_hashes:
-            await update.message.reply_text("❌ لا توجد جلسة نشطة. ابدأ من جديد.")
-            return
-        
-        # جلب الأكواد من context
-        codes = context.user_data.get('temp_codes', [])
-        if len(codes) != len(phones):
-            await update.message.reply_text(f"⚠️ يجب إدخال {len(phones)} كود. أدخل الأكواد أولاً.")
-            return
-        
-        await update.message.reply_text(f"⏳ جاري التحقق من الأكواد وتسجيل {len(phones)} رقم...")
-        
-        success_count = 0
-        fail_count = 0
-        results = []
-        
-        for i, (phone, code) in enumerate(zip(phones, codes)):
-            try:
-                # استعادة العميل من التخزين (نحتاج لإعادة إنشاء العميل)
-                client = TelegramClient(StringSession(), API_ID, API_HASH)
-                await client.connect()
-                await client.sign_in(phone, code, phone_code_hash=code_hashes[i])
-                session_str = client.session.save()
-                
-                # حفظ الحساب في قاعدة البيانات
-                cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
-                cursor.execute("INSERT INTO accounts (user_id, session, phone, is_active) VALUES (?, ?, ?, 1)", 
-                             (user_id, session_str, phone))
-                db.commit()
-                
-                success_count += 1
-                results.append(f"✅ {phone} → تم التسجيل بنجاح")
-                await update.message.reply_text(f"✅ تم تسجيل الرقم {i+1}: {phone}")
-                
-            except Exception as e:
-                fail_count += 1
-                results.append(f"❌ {phone} → فشل: {str(e)}")
-                await update.message.reply_text(f"❌ فشل تسجيل {phone}: {str(e)}")
-        
-        # تنظيف الجلسات
-        delete_multi_register_state(user_id)
-        context.user_data.pop('multi_register_step', None)
-        context.user_data.pop('temp_codes', None)
-        
-        # تقرير نهائي
-        report = "📊 **تقرير تسجيل الأرقام**\n\n"
-        report += f"✅ نجاح: {success_count}\n"
-        report += f"❌ فشل: {fail_count}\n\n"
-        report += "\n".join(results)
-        
-        await update.message.reply_text(report, parse_mode="Markdown")
-        return
-
-    # معالجة الأكواد المدخلة
-    lines = text.split('\n')
-    codes = []
-    for line in lines:
-        code = line.strip()
-        if code and code.isdigit():
-            codes.append(code)
-    
-    if not codes:
-        await update.message.reply_text("⚠️ لم يتم التعرف على أي أكواد. أرسل الأكواد فقط (أرقام).")
-        return
-    
-    phones, _, _, _ = get_multi_register_state(user_id)
-    if not phones:
-        await update.message.reply_text("❌ لا توجد جلسة نشطة. ابدأ من جديد.")
-        return
-    
-    if len(codes) > len(phones):
-        await update.message.reply_text(f"⚠️ أدخلت {len(codes)} كود، لكن المطلوب {len(phones)} كود فقط.")
-        return
-    
-    context.user_data['temp_codes'] = codes
-    await update.message.reply_text(f"✅ تم استلام {len(codes)} كود.\nاضغط على زر '✅ إرسال الأكواد' لإتمام التسجيل.")
 
 # ========== دوال الشحن والإدارة ==========
 async def handle_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1348,8 +1114,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("📱 أرقامي المسجلة"), KeyboardButton("🗑️ حذف رقم مسجل")],
         [KeyboardButton("⏱️ تحديد الوقت"), KeyboardButton("💤 استراحة كل 5 روابط")],
         [KeyboardButton("📊 حالة النظام"), KeyboardButton("🗑️ مسح الروابط")],
-        [KeyboardButton("📁 مجلدات الروابط"), KeyboardButton("💳 شحن حسابي")],
-        [KeyboardButton("📱 تسجيل أرقام متعددة")]
+        [KeyboardButton("📁 مجلدات الروابط"), KeyboardButton("💳 شحن حسابي")]
     ]
 
     if has_multi_join_permission(user_id):
@@ -1492,20 +1257,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "/start":
         return await start(update, context)
-
-    # ========== معالجة التسجيل المتعدد ==========
-    if text == "📱 تسجيل أرقام متعددة":
-        await handle_multi_register(update, context)
-        return
-
-    # ========== معالجة خطوات التسجيل المتعدد ==========
-    step = context.user_data.get('multi_register_step')
-    if step == 'waiting_phones':
-        await handle_multi_register_phones(update, context)
-        return
-    elif step == 'waiting_codes':
-        await handle_multi_register_codes(update, context)
-        return
 
     # ========== زر شحن حسابي ==========
     if text == "💳 شحن حسابي":
@@ -1949,7 +1700,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_add_package_input(update, context)
         return
 
-    # ========== معالجة شحن النقاط للمعلم (بعد إرسال الرقم والعدد) ==========
+    # ========== معالجة شحن النقاط للمعلم ==========
     if action == 'admin_charge_id' and user_id == ADMIN_ID:
         try:
             target = int(text)
@@ -2064,5 +1815,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 البوت يعمل مع نظام التسجيل المتعدد...")
+    print("🚀 البوت يعمل مع نظام الانضمام المتعدد وإدارة الباقات...")
     app.run_polling()
