@@ -668,10 +668,15 @@ async def start_joining_from_callback(update, context, user_id, folder_id, folde
 
 async def start_multi_joining(update, context, user_id, folder_id, folder_name):
     """بدء الانضمام المتعدد باستخدام جميع الحسابات المسجلة"""
+    # التحقق من وجود حسابات مسجلة
     cursor.execute("SELECT id, session, phone FROM accounts WHERE user_id=?", (user_id,))
     accounts = cursor.fetchall()
     if not accounts:
-        await update.effective_message.reply_text("❌ لا توجد حسابات مسجلة.")
+        await update.effective_message.reply_text(
+            "❌ لا توجد حسابات مسجلة لديك.\n"
+            "يرجى تسجيل حساب أولاً من خلال زر '📱 تسجيل الدخول الجديد'.\n"
+            "ثم حاول مرة أخرى."
+        )
         return
 
     links = get_folder_links(folder_id)
@@ -990,7 +995,7 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await query.edit_message_reply_markup(reply_markup=None)
         
-        # إرسال إشعار للمستخدم
+        # إرسال إشعار للمستخدم - مع تجاهل الأخطاء
         try:
             await context.bot.send_message(
                 chat_id=user_id,
