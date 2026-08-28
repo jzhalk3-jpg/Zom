@@ -680,7 +680,7 @@ async def handle_charge_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         del user_charge_state[user_id]
     context.user_data['awaiting_charge_photo'] = False
 
-# ========== معالجة قبول/رفض طلب الشحن من المشرف ==========
+# ========== معالجة قبول/رفض طلب الشحن من المشرف (معدلة) ==========
 async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -698,15 +698,34 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ الطلب غير موجود.")
             return
         user_id, amount = charge_data
+        
         # إضافة النقاط
         add_balance(user_id, amount)
         update_charge_request_status(request_id, 'completed')
-        await query.edit_message_text(f"✅ تم قبول الطلب رقم {request_id} وإضافة {amount} نقطة للمستخدم `{user_id}`.")
+        
+        # تعديل الرسالة الأصلية للمشرف (تحديث النص وإزالة الأزرار)
+        new_caption = (
+            f"✅ **تم قبول طلب الشحن**\n\n"
+            f"👤 المستخدم: `{user_id}`\n"
+            f"💰 عدد النقاط: {amount}\n"
+            f"🆔 رقم الطلب: {request_id}\n\n"
+            f"تمت إضافة النقاط بنجاح."
+        )
+        await query.edit_message_caption(
+            caption=new_caption,
+            parse_mode="Markdown"
+        )
+        # إزالة الأزرار (تحديث بدون reply_markup)
+        await query.edit_message_reply_markup(reply_markup=None)
+        
         # إشعار المستخدم
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"🎉 تم قبول طلب الشحن الخاص بك وإضافة {amount} نقطة إلى رصيدك.")
-        except:
-            pass
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🎉 تم شحن رصيدك بنجاح!\nتم إضافة {amount} نقطة إلى حسابك."
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify user {user_id}: {e}")
 
     elif data.startswith("reject_charge_"):
         request_id = int(data.split("_")[2])
@@ -716,11 +735,28 @@ async def admin_charge_decision(update: Update, context: ContextTypes.DEFAULT_TY
             return
         user_id, _ = charge_data
         update_charge_request_status(request_id, 'rejected')
-        await query.edit_message_text(f"❌ تم رفض الطلب رقم {request_id}.")
+        
+        # تعديل الرسالة الأصلية للمشرف
+        new_caption = (
+            f"❌ **تم رفض طلب الشحن**\n\n"
+            f"👤 المستخدم: `{user_id}`\n"
+            f"🆔 رقم الطلب: {request_id}\n\n"
+            f"تم رفض الطلب."
+        )
+        await query.edit_message_caption(
+            caption=new_caption,
+            parse_mode="Markdown"
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        
+        # إشعار المستخدم
         try:
-            await context.bot.send_message(chat_id=user_id, text="❌ تم رفض طلب الشحن الخاص بك. يرجى التواصل مع الإدارة.")
-        except:
-            pass
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ لم يتم الشحن بنجاح. يرجى التواصل مع الإدارة."
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify user {user_id}: {e}")
 
 # ========== معالجة الكولباك ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1576,4 +1612,215 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.commit()
             await update.message.reply_text(f"✅ تم تحديث وقت الاستراحة إلى: {new_rest} دقائق.")
         except ValueError:
-            await update.messa
+            await update.message.reply_text("❌ يرجى إرسال رقم صحيح (0 أو أكثر).")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة استثناء التوقف ==========
+    if action == 'admin_exempt_user' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,))
+            set_user_exempted(target, True)
+            await update.message.reply_text(f"✅ تم تشغيل البوت للمستخدم `{target}` (مستثنى من التوقف العام).")
+            try:
+                await context.bot.send_message(chat_id=target, text="✅ تم تفعيل البوت لك رغم التوقف العام، يمكنك استخدامه الآن.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    if action == 'admin_remove_exempt' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            set_user_exempted(target, False)
+            await update.message.reply_text(f"✅ تم إلغاء استثناء المستخدم `{target}` (سيتوقف البوت لديه عند التوقف العام).")
+            try:
+                await context.bot.send_message(chat_id=target, text="⚠️ تم إلغاء استثناء التوقف عن البوت، سيتوقف لديك عند إيقاف البوت العام.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة الحظر ==========
+    if action == 'admin_ban_user' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            if target == ADMIN_ID:
+                await update.message.reply_text("❌ لا يمكن حظر المشرف نفسه.")
+                context.user_data.clear()
+                return
+            cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,))
+            ban_user(target)
+            await update.message.reply_text(f"✅ تم حظر المستخدم `{target}` بنجاح.")
+            try:
+                await context.bot.send_message(chat_id=target, text="⛔ تم حظرك من استخدام هذا البوت.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    if action == 'admin_unban_user' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            unban_user(target)
+            await update.message.reply_text(f"✅ تم إلغاء حظر المستخدم `{target}` بنجاح.")
+            try:
+                await context.bot.send_message(chat_id=target, text="✅ تم إلغاء حظرك، يمكنك استخدام البوت الآن.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة منح وإلغاء صلاحية الانضمام المتعدد ==========
+    if action == 'admin_grant_multi_join' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,))
+            grant_multi_join_permission(target)
+            await update.message.reply_text(f"✅ تم منح صلاحية الانضمام المتعدد للمستخدم `{target}`")
+            try:
+                await context.bot.send_message(chat_id=target, text="🎉 تم منحك صلاحية استخدام الانضمام المتعدد (أكثر من حساب في نفس الوقت).")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    if action == 'admin_revoke_multi_join' and user_id == ADMIN_ID:
+        try:
+            target = int(text)
+            revoke_multi_join_permission(target)
+            await update.message.reply_text(f"✅ تم إلغاء صلاحية الانضمام المتعدد للمستخدم `{target}`")
+            try:
+                await context.bot.send_message(chat_id=target, text="⚠️ تم إلغاء صلاحية الانضمام المتعدد الخاصة بك.")
+            except:
+                pass
+        except ValueError:
+            await update.message.reply_text("❌ معرف غير صحيح.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة سحب روابط المستخدم (للمشرف) ==========
+    if action == 'admin_fetch_user_links' and user_id == ADMIN_ID:
+        try:
+            target_uid = int(text)
+            await handle_fetch_user_links(update, context, target_uid)
+        except ValueError:
+            await update.message.reply_text("❌ يرجى إدخال معرف رقمي صحيح.")
+        context.user_data.clear()
+        return
+
+    # ========== معالجة الإذاعة ==========
+    if action == 'admin_broadcast' and user_id == ADMIN_ID:
+        if text == "/cancel":
+            context.user_data.clear()
+            await update.message.reply_text("❌ تم إلغاء الإذاعة.")
+            return
+        cursor.execute("SELECT user_id FROM users")
+        all_users = cursor.fetchall()
+        success = 0
+        fail = 0
+        await update.message.reply_text(f"🚀 جاري الإرسال إلى {len(all_users)} مستخدم...")
+        for (u_id,) in all_users:
+            try:
+                await context.bot.send_message(chat_id=u_id, text=text)
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                fail += 1
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ تم الإرسال: {success} نجاح، {fail} فشل.")
+        return
+
+    # ========== معالجة تسجيل الدخول ==========
+    if action == 'login_phone':
+        context.user_data['temp_phone'] = text
+        await update.message.reply_text("⏳ جاري إرسال كود التحقق...\nأرسل الكود فور وصوله:")
+        try:
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            send_code = await client.send_code_request(text)
+            context.user_data['phone_code_hash'] = send_code.phone_code_hash
+            context.user_data['client_obj'] = client
+            context.user_data['action'] = 'login_otp'
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ: {str(e)}")
+            context.user_data.clear()
+        return
+
+    if action == 'login_otp':
+        phone = context.user_data.get('temp_phone')
+        phone_code_hash = context.user_data.get('phone_code_hash')
+        client = context.user_data.get('client_obj')
+        try:
+            await client.sign_in(phone, text, phone_code_hash=phone_code_hash)
+            session_str = client.session.save()
+            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
+            cursor.execute("INSERT INTO accounts (user_id, session, phone, is_active) VALUES (?, ?, ?, 1)", (user_id, session_str, phone))
+            db.commit()
+            await update.message.reply_text(f"🎉 تم إضافة الرقم {phone} وتفعيله.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ في الكود: {str(e)}")
+        finally:
+            if client:
+                await client.disconnect()
+            context.user_data.clear()
+        return
+
+    if action == 'switch_account':
+        cursor.execute("SELECT id FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+        acc = cursor.fetchone()
+        if acc:
+            cursor.execute("UPDATE accounts SET is_active=0 WHERE user_id=?", (user_id,))
+            cursor.execute("UPDATE accounts SET is_active=1 WHERE user_id=? AND phone=?", (user_id, text))
+            db.commit()
+            await update.message.reply_text(f"✅ تم تفعيل الرقم: {text}")
+        else:
+            await update.message.reply_text("❌ هذا الرقم غير موجود في قائمتك.")
+        context.user_data.clear()
+        return
+
+    if action == 'delete_account':
+        cursor.execute("SELECT id, is_active FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+        acc = cursor.fetchone()
+        if acc:
+            cursor.execute("DELETE FROM accounts WHERE user_id=? AND phone=?", (user_id, text))
+            if acc[1] == 1:
+                cursor.execute("SELECT id FROM accounts WHERE user_id=? LIMIT 1", (user_id,))
+                other = cursor.fetchone()
+                if other:
+                    cursor.execute("UPDATE accounts SET is_active=1 WHERE id=?", (other[0],))
+            db.commit()
+            await update.message.reply_text(f"🗑️ تم حذف الرقم {text} نهائياً.")
+        else:
+            await update.message.reply_text("❌ لم يتم العثور على هذا الرقم.")
+        context.user_data.clear()
+        return
+
+    await update.message.reply_text("⚠️ زر غير معروف أو حدث خطأ، يرجى استخدام الأزرار المتاحة.")
+
+# ========== معالجة الصور (لشحن الحساب) ==========
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if context.user_data.get('awaiting_charge_photo'):
+        await handle_charge_photo(update, context)
+
+# ========== تشغيل البوت ==========
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(BOT_TOKEN).job_queue(None).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    print("🚀 البوت يعمل مع نظام الشحن الجديد (قبول/رفض) وشحن النقاط للمعلم...")
+    app.run_polling()
