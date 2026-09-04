@@ -9,7 +9,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboard
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # --- الإعدادات الأساسية ---
-BOT_TOKEN = "8969957914:AAF33nKExvFFry5ImvGirDU4oYraLMX3tHc"
+BOT_TOKEN = "8594916658:AAGVvRykLBagL-DToRlhCo-iy_xdBcdMsRM"
 API_ID = 39289901
 API_HASH = "a5dcef068387dd95705046f910d6cd48"
 
